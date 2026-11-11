@@ -47,8 +47,14 @@ function Build-App {
     if ($Task -ne 'Run') { return $true }
     Stop-App
     Close-Logs
-    $binary = Join-Path $runDir 'ultra-bar.exe'
-    Copy-Item -LiteralPath (Join-Path $env:CARGO_TARGET_DIR 'debug/ultra-bar.exe') -Destination $binary -Force
+    # Recovery helpers can retain the previous image after the UI has exited.
+    # Keep immutable development copies rather than overwriting their executable.
+    $built = Join-Path $env:CARGO_TARGET_DIR 'debug/ultra-bar.exe'
+    $hash = (Get-FileHash -LiteralPath $built -Algorithm SHA256).Hash.Substring(0,16).ToLowerInvariant()
+    $release = Join-Path $runDir "releases/$hash"
+    New-Item -ItemType Directory -Force $release | Out-Null
+    $binary = Join-Path $release 'ultra-bar.exe'
+    if (-not (Test-Path -LiteralPath $binary)) { Copy-Item -LiteralPath $built -Destination $binary }
     $start = [Diagnostics.ProcessStartInfo]::new($binary)
     $start.WorkingDirectory = $root
     $start.UseShellExecute = $false
