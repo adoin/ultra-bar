@@ -34,6 +34,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.96.0'
+          components: clippy
       - name: Validate release tag
         shell: pwsh
         run: |
