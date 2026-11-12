@@ -28,8 +28,10 @@ pub enum Target {
     CloseWindow { hwnd: usize, pid: u32 },
     ThisPc,
     SettingsCommand(usize),
+    TaskbarCommand(usize),
     Jump { generation: u64, index: usize },
     Script { generation: u64, index: usize },
+    RenameScript { generation: u64, index: usize },
 }
 impl Target {
     fn close_available(self) -> Option<bool> {
@@ -47,6 +49,8 @@ impl Target {
             | Self::CloseGroup(_)
             | Self::Jump { .. }
             | Self::Script { .. }
+            | Self::RenameScript { .. }
+            | Self::TaskbarCommand(_)
             | Self::ThisPc => true,
             Self::SettingsCommand(_) => true,
             Self::Window { hwnd, pid } | Self::CloseWindow { hwnd, pid } => unsafe {
@@ -572,6 +576,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
             WM_MOUSELEAVE => {
                 state.hover = None;
                 InvalidateRect(hwnd, null(), 0);
+                0
+            }
+            WM_RBUTTONUP => {
+                if let Some(Hit::Select(index)) = hit(
+                    state,
+                    l as u16 as i16 as i32,
+                    (l >> 16) as u16 as i16 as i32,
+                ) && let Target::Script { generation, index } = state.items[index].target
+                {
+                    state.selection = Some(Target::RenameScript { generation, index });
+                    ShowWindow(hwnd, SW_HIDE);
+                    PostMessageW(state.owner, SELECTED, 0, 0);
+                }
                 0
             }
             WM_LBUTTONDOWN => {

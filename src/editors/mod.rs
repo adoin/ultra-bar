@@ -23,6 +23,7 @@ use windows_sys::Win32::{
 };
 pub const UPDATE: u32 = WM_APP + 30;
 pub const FAILED: u32 = WM_APP + 31;
+type LocalSave = Box<dyn Fn(&Values) -> Result<()>>;
 struct Binding {
     field: Field,
     inputs: Vec<HWND>,
@@ -46,6 +47,7 @@ struct View {
     saving: bool,
     mount: bool,
     loading: bool,
+    local_save: Option<LocalSave>,
 }
 pub struct Window(Box<View>);
 struct ProviderState {
@@ -210,8 +212,20 @@ pub struct Manager {
     pending: VecDeque<(HWND, Request)>,
     windows: Vec<Window>,
     settings: Vec<String>,
+    local_pending: VecDeque<(Form, LocalSave)>,
 }
 impl Manager {
+    /// Internal forms use the same controls and validation as plugin editors.
+    pub fn open_local(
+        &mut self,
+        form: Form,
+        save: impl Fn(&Values) -> Result<()> + 'static,
+    ) -> Result<()> {
+        form.validate_schema().map_err(anyhow::Error::msg)?;
+        ensure!(self.local_pending.len() < 32, "待编辑项目过多");
+        self.local_pending.push_back((form, Box::new(save)));
+        Ok(())
+    }
     pub unsafe fn delivery_failed(&mut self, caller: HWND, session: u64) {
         unsafe {
             if let Some(window) = self
@@ -301,9 +315,11 @@ impl Manager {
         true
     }
     pub fn busy(&self) -> bool {
-        self.windows
-            .iter()
-            .any(|w| !w.0.mount && unsafe { IsWindow(w.0.hwnd) != 0 })
+        !self.local_pending.is_empty()
+            || self
+                .windows
+                .iter()
+                .any(|w| !w.0.mount && unsafe { IsWindow(w.0.hwnd) != 0 })
     }
     pub fn take_settings(&mut self) -> Vec<String> {
         std::mem::take(&mut self.settings)
@@ -331,6 +347,16 @@ impl Manager {
     pub unsafe fn apply(&mut self, host: HWND) {
         unsafe {
             self.windows.retain(|w| IsWindow(w.0.hwnd) != 0);
+            if !self.windows.iter().any(|w| w.0.local_save.is_some())
+                && let Some((form, save)) = self.local_pending.pop_front()
+            {
+                match create(host, host, "ultra-bar".into(), form, None, Some(save)) {
+                    Ok(window) => {
+                        self.windows.push(window);
+                    }
+                    Err(error) => eprintln!("[editors] {error:#}"),
+                }
+            }
             while let Some((caller, request)) = self.pending.pop_front() {
                 match request.operation {
                     Operation::Open { form } => {
@@ -342,7 +368,9 @@ impl Manager {
                             SetForegroundWindow(old.0.hwnd);
                             continue;
                         }
-                        if let Ok(window) = create(host, caller, request.plugin_id, form, None) {
+                        if let Ok(window) =
+                            create(host, caller, request.plugin_id, form, None, None)
+                        {
                             self.windows.push(window);
                         }
                     }
@@ -378,6 +406,7 @@ impl Manager {
                                 right: x + width,
                                 bottom: y + height,
                             }),
+                            None,
                         ) {
                             self.windows.push(window);
                         }
@@ -554,6 +583,14 @@ unsafe fn emit(host: HWND, caller: HWND, event: EditorEvent) {
     }
 }
 unsafe fn send(view: &View, action: &str, values: Values) {
+    if view.local_save.is_some() {
+        if action == "closed" {
+            unsafe {
+                PostMessageW(view.host, UPDATE, 0, 0);
+            }
+        }
+        return;
+    }
     unsafe {
         emit(
             view.host,
@@ -697,6 +734,7 @@ unsafe fn create(
     plugin: String,
     form: Form,
     mount: Option<RECT>,
+    local_save: Option<LocalSave>,
 ) -> Result<Window> {
     unsafe {
         form.validate_schema().map_err(anyhow::Error::msg)?;
@@ -749,6 +787,7 @@ unsafe fn create(
             saving: false,
             mount: mount.is_some(),
             loading: true,
+            local_save,
         });
         let mut info: MONITORINFO = zeroed();
         info.cbSize = size_of::<MONITORINFO>() as u32;
@@ -1076,6 +1115,31 @@ unsafe fn create(
                     );
                     SendMessageW(h, WM_SETFONT, view.icons as usize, 0);
                     ultra_bar_native_ui::input::attach_label(h);
+                    if view.local_save.is_some() && id == 9002 {
+                        let tip = CreateWindowExW(
+                            WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                            TOOLTIPS_CLASSW,
+                            null(),
+                            WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                            0,
+                            0,
+                            0,
+                            0,
+                            hwnd,
+                            null_mut(),
+                            instance,
+                            null(),
+                        );
+                        let info = TTTOOLINFOW {
+                            cbSize: std::mem::offset_of!(TTTOOLINFOW, lpReserved) as u32,
+                            uFlags: TTF_IDISHWND | TTF_SUBCLASS,
+                            hwnd,
+                            uId: h as usize,
+                            lpszText: windows_sys::core::w!("跳过，保留原名").cast_mut(),
+                            ..zeroed()
+                        };
+                        SendMessageW(tip, TTM_ADDTOOLW, 0, (&info as *const TTTOOLINFOW) as isize);
+                    }
                 }
             }
         }
@@ -1083,7 +1147,7 @@ unsafe fn create(
         view.loading = false;
         if !view.mount {
             EnableWindow(caller, 0);
-            if !std::env::args().any(|a| a == "--editor-host-smoke") {
+            if !std::env::args().any(|a| a == "--editor-host-smoke" || a == "--script-drop-smoke") {
                 ShowWindow(hwnd, SW_SHOW);
                 SetForegroundWindow(hwnd);
                 if let Some(input) = view
@@ -1094,6 +1158,9 @@ unsafe fn create(
                     .find(|h| IsWindowVisible(**h) != 0)
                 {
                     SetFocus(*input);
+                    if view.local_save.is_some() {
+                        SendMessageW(*input, EM_SETSEL, 0, -1);
+                    }
                 }
             } else {
                 SetWindowPos(
@@ -1741,6 +1808,18 @@ unsafe extern "system" fn proc(hwnd: HWND, m: u32, w: usize, l: isize) -> LRESUL
                     };
                     match result {
                         Ok(values) => {
+                            if let Some(save) = &view.local_save {
+                                match save(&values) {
+                                    Ok(()) => {
+                                        DestroyWindow(hwnd);
+                                    }
+                                    Err(error) => {
+                                        view.error = format!("{error:#}");
+                                        InvalidateRect(hwnd, null(), 0);
+                                    }
+                                }
+                                return 0;
+                            }
                             view.saving = true;
                             layout(view);
                             send(view, if id == 9003 { "delete" } else { "submit" }, values);
@@ -2039,6 +2118,31 @@ pub unsafe fn smoke(directory: &std::path::Path, schema: Option<&std::path::Path
             Ok(())
         })();
         drop(manager);
+        let result = result.and_then(|()| {
+            let saved = std::rc::Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+            let mut local = Manager::default();
+            for name in ["first", "second"] {
+                let saved = saved.clone();
+                local.open_local(Form {
+                    session: 0, title: "脚本别名".into(),
+                    fields: vec![Field::new("alias", "脚本", Kind::Text, name)],
+                    can_delete: false,
+                }, move |values| { saved.borrow_mut().push(values["alias"].clone()); Ok(()) })?;
+            }
+            local.apply(owner);
+            ensure!(local.windows.len() == 1 && local.local_pending.len() == 1, "批量别名弹窗没有顺序展示");
+            let h = local.windows[0].0.hwnd;
+            SetWindowTextW(local.windows[0].0.bindings[0].inputs[0], wide("我的脚本").as_ptr());
+            SendMessageW(h, WM_COMMAND, 9001, 0);
+            ensure!(IsWindow(h) == 0 && *saved.borrow() == ["我的脚本"], "别名保存未完成或未关闭弹窗");
+            local.apply(owner);
+            let h = local.windows[0].0.hwnd;
+            SendMessageW(h, WM_COMMAND, 9002, 0);
+            local.apply(owner);
+            ensure!(!local.busy() && saved.borrow().len() == 1 && IsWindowEnabled(owner) != 0, "跳过别名没有保留原状态");
+            std::fs::write(directory.join("local-editor-result.json"), serde_json::to_vec_pretty(&serde_json::json!({"save":true,"skip":true,"batch_sequential":true,"global_input":false}))?)?;
+            Ok(())
+        });
         DestroyWindow(owner);
         result
     }

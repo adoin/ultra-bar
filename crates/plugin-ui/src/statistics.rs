@@ -52,6 +52,31 @@ pub struct Agent {
     pub available: bool,
     pub breakdown: bool,
     pub buckets: Vec<Bucket>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversations: Option<Conversations>,
+    #[serde(default)]
+    pub mode: StatisticsMode,
+}
+#[derive(Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatisticsMode {
+    #[default]
+    Tokens,
+    Conversations,
+    Blank,
+}
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct ConversationDay {
+    pub day: i32,
+    pub date: String,
+    pub session: String,
+    pub sent: u64,
+    pub received: u64,
+}
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Conversations {
+    pub rows: Vec<ConversationDay>,
+    pub partial: bool,
 }
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Dataset {
@@ -71,6 +96,33 @@ pub struct View {
 #[cfg(test)]
 mod navigation_tests {
     use super::*;
+    #[test]
+    fn conversation_views_offer_only_relevant_tabs_and_missing_sources_stay_blank() {
+        let mut view = View::default();
+        view.replace(Dataset {
+            agents: vec![Agent {
+                mode: StatisticsMode::Conversations,
+                conversations: Some(Conversations::default()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert_eq!(view.tabs(), ["概览", "最近几天"]);
+        view.click(130, 74);
+        assert_eq!(view.tab, 1);
+        view.click(330, 74);
+        assert_eq!(view.tab, 1);
+        view.replace(Dataset {
+            agents: vec![Agent {
+                mode: StatisticsMode::Blank,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(view.tabs().is_empty());
+        assert!(!view.click(130, 74));
+        assert_eq!(view.tab, 0);
+    }
     #[test]
     fn reset_details_open_from_count_and_return_without_switching_agents() {
         let mut view = View::default();
@@ -267,12 +319,26 @@ pub fn smoke(directory: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 impl View {
+    fn tabs(&self) -> &'static [&'static str] {
+        match self
+            .data
+            .agents
+            .get(self.agent)
+            .map(|a| a.mode)
+            .unwrap_or_default()
+        {
+            StatisticsMode::Tokens => &["概览", "项目", "最近几天", "Token 构成", "模型"],
+            StatisticsMode::Conversations => &["概览", "最近几天"],
+            StatisticsMode::Blank => &[],
+        }
+    }
     pub fn replace(&mut self, data: Dataset) {
         let id = self.data.agents.get(self.agent).map(|a| a.id.clone());
         self.agent = id
             .and_then(|id| data.agents.iter().position(|a| a.id == id))
             .unwrap_or(0);
         self.data = data;
+        self.tab = self.tab.min(self.tabs().len().saturating_sub(1));
         if self.days == 0 {
             self.days = 7;
         }
@@ -282,6 +348,7 @@ impl View {
             let i = ((x - 24) / 132).max(0) as usize;
             if x >= 24 && i < self.data.agents.len() {
                 self.agent = i;
+                self.tab = 0;
                 self.reset_details = false;
                 self.scroll = 0;
                 return true;
@@ -309,6 +376,9 @@ impl View {
         }
         let top = 60;
         if (top..top + 34).contains(&y) {
+            if self.tabs().is_empty() {
+                return false;
+            }
             if x >= 506 {
                 self.days = match self.days {
                     7 => 14,
@@ -317,7 +387,7 @@ impl View {
                 };
             } else if x >= 24 {
                 let i = ((x - 24) / 92) as usize;
-                if i < 5 {
+                if i < self.tabs().len() {
                     self.tab = i;
                     self.reset_details = false;
                 }
@@ -468,10 +538,7 @@ impl View {
             text("\u{e72c}", 602, 14, 24, 28, p.muted, icons, DT_CENTER);
             text("\u{e711}", 644, 14, 20, 28, p.muted, icons, DT_CENTER);
             line(24, 54, 632, faint);
-            for (i, label) in ["概览", "项目", "最近几天", "Token 构成", "模型"]
-                .iter()
-                .enumerate()
-            {
+            for (i, label) in self.tabs().iter().enumerate() {
                 let x = 24 + i as i32 * 92;
                 text(
                     label,
@@ -487,9 +554,9 @@ impl View {
                     round(
                         x,
                         99,
-                        if i == 3 {
+                        if *label == "Token 构成" {
                             68
-                        } else if i == 2 {
+                        } else if label.chars().count() >= 4 {
                             56
                         } else {
                             28
@@ -500,16 +567,18 @@ impl View {
                     );
                 }
             }
-            text(
-                &format!("最近 {} 天  ›", self.days),
-                512,
-                64,
-                144,
-                28,
-                p.muted,
-                font,
-                DT_RIGHT,
-            );
+            if !self.tabs().is_empty() {
+                text(
+                    &format!("最近 {} 天  ›", self.days),
+                    512,
+                    64,
+                    144,
+                    28,
+                    p.muted,
+                    font,
+                    DT_RIGHT,
+                );
+            }
             let content_top = 120;
             if matches!(self.tab, 0 | 3) && !self.reset_details {
                 self.scroll = self
@@ -531,6 +600,179 @@ impl View {
                 bounds.bottom - unit(46),
             );
             if let Some(agent) = self.data.agents.get(self.agent) {
+                if agent.mode != StatisticsMode::Tokens {
+                    if let Some(data) = &agent.conversations
+                        && agent.mode == StatisticsMode::Conversations
+                    {
+                        let rows: Vec<_> = data
+                            .rows
+                            .iter()
+                            .filter(|r| {
+                                r.day > self.data.today - self.days && r.day <= self.data.today
+                            })
+                            .collect();
+                        let mut daily = BTreeMap::<i32, (u64, u64)>::new();
+                        let mut sessions = HashSet::new();
+                        let (mut sent, mut received) = (0, 0);
+                        for row in &rows {
+                            sent += row.sent;
+                            received += row.received;
+                            sessions.insert(&row.session);
+                            let day = daily.entry(row.day).or_default();
+                            day.0 += row.sent;
+                            day.1 += row.received;
+                        }
+                        if self.tab == 0 {
+                            self.scroll = 0;
+                            round(24, 120, 632, 88, 16, blend(p.field, p.background, 0.30));
+                            for (i, (name, value)) in [
+                                ("会话", sessions.len() as u64),
+                                ("发送消息", sent),
+                                ("收到回复", received),
+                                ("活跃天数", daily.len() as u64),
+                            ]
+                            .iter()
+                            .enumerate()
+                            {
+                                let x = 40 + i as i32 * 156;
+                                text(name, x, 132, 136, 22, p.muted, small, 0);
+                                text(&value.to_string(), x, 158, 136, 34, p.text, value_font, 0);
+                            }
+                            text("每日消息", 24, 232, 200, 26, p.text, medium, 0);
+                            let max =
+                                daily.values().map(|(a, b)| a + b).max().unwrap_or(0).max(1) as f64;
+                            let peak = (max / 3.).ceil().max(1.) * 3.;
+                            let plot_height = (height - 390).clamp(80, 180);
+                            for n in 0..=3 {
+                                let gy = 276 + plot_height - plot_height * n / 3;
+                                line(78, gy, 578, faint);
+                                text(
+                                    &format!("{:.0}", peak * n as f64 / 3.),
+                                    24,
+                                    gy - 10,
+                                    42,
+                                    20,
+                                    p.disabled,
+                                    small,
+                                    DT_RIGHT,
+                                );
+                            }
+                            let pitch = 578. / self.days as f64;
+                            let width = (pitch * 0.34).round().clamp(4., 18.) as i32;
+                            for n in 0..self.days {
+                                let day = self.data.today - self.days + 1 + n;
+                                let (out, incoming) = daily.get(&day).copied().unwrap_or_default();
+                                let x = 78 + ((n as f64 + 0.5) * pitch).round() as i32;
+                                let out_h = (out as f64 / peak * plot_height as f64).round() as i32;
+                                let in_h =
+                                    (incoming as f64 / peak * plot_height as f64).round() as i32;
+                                if out_h > 0 {
+                                    round(
+                                        x - width / 2,
+                                        276 + plot_height - out_h,
+                                        width,
+                                        out_h,
+                                        2,
+                                        p.active_border,
+                                    );
+                                }
+                                if in_h > 0 {
+                                    round(
+                                        x - width / 2,
+                                        276 + plot_height - out_h - in_h,
+                                        width,
+                                        in_h,
+                                        2,
+                                        blend(p.active_border, p.text, 0.45),
+                                    );
+                                }
+                                if (self.days <= 7 || n % 7 == 0 || n == self.days - 1)
+                                    && let Some(date) =
+                                        chrono::NaiveDate::from_num_days_from_ce_opt(day)
+                                {
+                                    text(
+                                        &date.format("%m-%d").to_string(),
+                                        x - 30,
+                                        284 + plot_height,
+                                        60,
+                                        20,
+                                        p.disabled,
+                                        small,
+                                        DT_CENTER,
+                                    );
+                                }
+                            }
+                            round(78, 318 + plot_height, 6, 6, 2, p.active_border);
+                            text(
+                                "发送消息",
+                                94,
+                                310 + plot_height,
+                                120,
+                                22,
+                                p.muted,
+                                small,
+                                0,
+                            );
+                            round(
+                                256,
+                                318 + plot_height,
+                                6,
+                                6,
+                                2,
+                                blend(p.active_border, p.text, 0.45),
+                            );
+                            text(
+                                "收到回复",
+                                272,
+                                310 + plot_height,
+                                120,
+                                22,
+                                p.muted,
+                                small,
+                                0,
+                            );
+                        } else {
+                            for (name, x) in [("日期", 24), ("发送消息", 270), ("收到回复", 470)]
+                            {
+                                text(name, x, 120, 180, 24, p.muted, small, 0);
+                            }
+                            let visible = ((height - 220) / 36).max(1) as usize;
+                            self.scroll = self
+                                .scroll
+                                .min((self.days as usize).saturating_sub(visible));
+                            for n in (0..self.days as usize).skip(self.scroll).take(visible) {
+                                let day = self.data.today - n as i32;
+                                let (out, incoming) = daily.get(&day).copied().unwrap_or_default();
+                                let at = 156 + (n - self.scroll) as i32 * 36;
+                                if let Some(date) =
+                                    chrono::NaiveDate::from_num_days_from_ce_opt(day)
+                                {
+                                    text(&date.to_string(), 24, at, 220, 28, p.text, font, 0);
+                                }
+                                text(&out.to_string(), 270, at, 180, 28, p.active_border, font, 0);
+                                text(&incoming.to_string(), 470, at, 180, 28, p.text, font, 0);
+                                line(24, at + 32, 632, faint);
+                            }
+                        }
+                        RestoreDC(dc, saved);
+                        text(
+                            &agent.source,
+                            24,
+                            height - 34,
+                            632,
+                            22,
+                            p.disabled,
+                            small,
+                            0,
+                        );
+                    } else {
+                        RestoreDC(dc, saved);
+                    }
+                    DeleteObject(small);
+                    DeleteObject(medium);
+                    DeleteObject(value_font);
+                    return;
+                }
                 let rows: Vec<_> = agent
                     .buckets
                     .iter()

@@ -1100,12 +1100,16 @@ fn app_error(owner: HWND, error: &anyhow::Error) {
 fn add_shortcuts(state: &mut State, paths: Vec<std::path::PathBuf>) {
     let mut next = state.pins.clone();
     let mut errors = vec![];
+    let mut scripts = vec![];
     for path in paths {
         match crate::task_apps::from_file(&path) {
             Ok(pin) => {
                 if crate::script_shortcuts::is_script(&pin.executable) {
                     match crate::script_shortcuts::add(pin) {
-                        Ok(()) => {
+                        Ok(added) => {
+                            if let Some(added) = added {
+                                scripts.push(added);
+                            }
                             if !next
                                 .iter()
                                 .any(|p| p.executable == crate::script_shortcuts::GROUP)
@@ -1145,6 +1149,58 @@ fn add_shortcuts(state: &mut State, paths: Vec<std::path::PathBuf>) {
     }
     if !errors.is_empty() {
         app_error(state.hwnd, &anyhow::anyhow!(errors.join("\n")));
+    }
+    edit_script_aliases(state, scripts);
+}
+fn edit_script_aliases(state: &mut State, scripts: Vec<crate::task_apps::Shortcut>) {
+    use ultra_bar_plugin_sdk::editors::{Field, Form, Kind};
+    // One scrollable form per batch; closing it keeps the saved original names.
+    for batch in scripts.chunks(64) {
+        let batch = batch.to_vec();
+        let fields = batch
+            .iter()
+            .enumerate()
+            .map(|(index, script)| {
+                let label = std::path::Path::new(&script.executable)
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let mut field =
+                    Field::new(&format!("alias{index}"), &label, Kind::Text, &script.name);
+                field.constraints.max_length = Some(256);
+                field
+            })
+            .collect();
+        let result = state.editors.open_local(
+            Form {
+                session: 0,
+                title: "脚本别名".into(),
+                fields,
+                can_delete: false,
+            },
+            move |values| {
+                let aliases: Vec<_> = batch
+                    .iter()
+                    .enumerate()
+                    .map(|(index, script)| {
+                        (
+                            script.launch.clone(),
+                            values
+                                .get(&format!("alias{index}"))
+                                .cloned()
+                                .unwrap_or_default(),
+                        )
+                    })
+                    .collect();
+                crate::script_shortcuts::rename(&aliases)
+            },
+        );
+        if let Err(error) = result {
+            app_error(state.hwnd, &error);
+        }
+    }
+    unsafe {
+        PostMessageW(state.hwnd, crate::editors::UPDATE, 0, 0);
     }
 }
 fn persist_pin_order(state: &mut State) {
@@ -1366,7 +1422,7 @@ unsafe fn show_scripts(state: &mut State, id: usize, context: bool) {
                     "\u{e943}",
                     std::path::Path::new(&script.executable).is_file(),
                 );
-                item.tooltip = Some(script.executable.clone());
+                item.tooltip = Some(format!("{}\n右键修改别名", script.executable));
                 item
             })
             .collect();
@@ -1443,6 +1499,18 @@ unsafe fn task_menu(state: &mut State, id: usize) {
 unsafe fn task_command(state: &mut State, target: crate::task_popup::Target) {
     unsafe {
         use crate::task_popup::Target;
+        if let Target::TaskbarCommand(command) = target {
+            taskbar_command(state, command);
+            return;
+        }
+        if let Target::RenameScript { generation, index } = target {
+            if generation == state.jump_generation
+                && let Some(script) = state.script_snapshot.get(index).cloned()
+            {
+                edit_script_aliases(state, vec![script]);
+            }
+            return;
+        }
         if let Target::SettingsCommand(command) = target {
             if command == 0 {
                 show_settings(state);
@@ -2511,6 +2579,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                     anchor.left = point.x;
                     anchor.right = point.x + 1;
                     let mut items = vec![
+                        Item::command(Target::TaskbarCommand(0), "任务管理器", "\u{e9d9}", true),
+                        Item::command(Target::TaskbarCommand(1), "显示桌面", "\u{e7f4}", true),
                         Item::command(Target::SettingsCommand(0), "设置", "\u{e713}", true),
                         Item::command(Target::SettingsCommand(10), "插件中心", "\u{e8f1}", true),
                         Item::command(
@@ -2526,6 +2596,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                             true,
                         ),
                     ];
+                    items[2].separator_before = true;
                     items.last_mut().unwrap().separator_before = true;
                     show_task_popup(state, "taskbar-menu".into(), String::new(), items, anchor);
                 }
@@ -3549,6 +3620,19 @@ unsafe fn smoke_script_drop(state: &mut State, directory: &std::path::Path) -> R
         );
         let scripts = crate::script_shortcuts::load();
         anyhow::ensure!(scripts.len() == 17, "脚本去重或快捷方式分类失败");
+        crate::script_shortcuts::rename(&[(scripts[0].launch.clone(), "  我的开发脚本  ".into())])?;
+        crate::script_shortcuts::rename(&[(scripts[0].launch.clone(), "  ".into())])?;
+        anyhow::ensure!(
+            crate::script_shortcuts::add(scripts[0].clone())?.is_none(),
+            "重复拖入创建了第二个别名提示"
+        );
+        let saved = crate::script_shortcuts::load();
+        anyhow::ensure!(
+            saved[0].name == "我的开发脚本"
+                && saved[0].launch == scripts[0].launch
+                && saved[0].executable == scripts[0].executable,
+            "别名覆盖了脚本路径或空名覆盖旧名"
+        );
         anyhow::ensure!(
             !fixtures.join("should-not-run.txt").exists(),
             "拖入时意外执行了脚本"
@@ -4411,6 +4495,47 @@ unsafe fn execute(state: &mut State, action: Action) {
     }
 }
 
+unsafe fn taskbar_command(state: &mut State, command: usize) {
+    unsafe {
+        ultra_bar_native_ui::diagnostics::event(
+            "shell",
+            "taskbar.command",
+            serde_json::json!({"command":command}),
+        );
+        match command {
+            0 => {
+                let target = {
+                    let mut directory = vec![0u16; 32768];
+                    let length =
+                        GetSystemDirectoryW(directory.as_mut_ptr(), directory.len() as u32);
+                    if length == 0 || length as usize >= directory.len() {
+                        app_error(state.hwnd, &anyhow::anyhow!("无法找到系统目录"));
+                        return;
+                    }
+                    std::path::PathBuf::from(String::from_utf16_lossy(
+                        &directory[..length as usize],
+                    ))
+                    .join("Taskmgr.exe")
+                    .to_string_lossy()
+                    .into_owned()
+                };
+                let result = ShellExecuteW(
+                    state.hwnd,
+                    wide("open").as_ptr(),
+                    wide(&target).as_ptr(),
+                    null(),
+                    null(),
+                    SW_SHOWNORMAL,
+                ) as isize;
+                if result <= 32 {
+                    app_error(state.hwnd, &anyhow::anyhow!("无法打开系统工具（{result}）"));
+                }
+            }
+            1 => shortcut(&[VK_LWIN, b'D' as u16]),
+            _ => {}
+        }
+    }
+}
 unsafe fn open_settings(uri: &str) {
     unsafe {
         ShellExecuteW(

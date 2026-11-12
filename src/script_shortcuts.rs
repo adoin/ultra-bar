@@ -68,7 +68,7 @@ fn save(entries: &[Shortcut]) -> Result<()> {
     );
     Ok(())
 }
-pub fn add(mut pin: Shortcut) -> Result<()> {
+pub fn add(mut pin: Shortcut) -> Result<Option<Shortcut>> {
     ensure!(is_script(&pin.executable), "不支持的脚本类型");
     if !Path::new(&pin.launch)
         .extension()
@@ -87,7 +87,36 @@ pub fn add(mut pin: Shortcut) -> Result<()> {
         .any(|p| normalize(&p.launch) == normalize(&pin.launch))
     {
         ensure!(entries.len() < 1024, "脚本列表已满");
-        entries.push(pin);
+        entries.push(pin.clone());
+        save(&entries)?;
+        return Ok(Some(pin));
+    }
+    Ok(None)
+}
+pub fn rename(aliases: &[(String, String)]) -> Result<()> {
+    let mut entries = read()?;
+    for (launch, name) in aliases {
+        ensure!(name.chars().count() <= 256, "别名不能超过 256 个字符");
+        ensure!(
+            entries
+                .iter()
+                .any(|p| normalize(&p.launch) == normalize(launch)),
+            "脚本入口已失效"
+        );
+    }
+    let mut changed = false;
+    for (launch, name) in aliases {
+        let name = name.trim();
+        if !name.is_empty() {
+            let entry = entries
+                .iter_mut()
+                .find(|p| normalize(&p.launch) == normalize(launch))
+                .unwrap();
+            changed |= entry.name != name;
+            entry.name = name.into();
+        }
+    }
+    if changed {
         save(&entries)?;
     }
     Ok(())
