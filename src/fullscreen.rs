@@ -37,6 +37,26 @@ pub unsafe fn active(owner: HWND, native: Option<usize>) -> bool {
         if pid == std::process::id() || GetAncestor(window, GA_ROOTOWNER) == owner {
             return false;
         }
+        // Shell flyouts can own monitor-sized transparent CoreWindows.
+        if class == "Windows.UI.Core.CoreWindow" || class == "XamlExplorerHostIslandWindow" {
+            let path = crate::task_apps::process_path(window);
+            let name = path
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            if matches!(
+                name.as_str(),
+                "startmenuexperiencehost.exe"
+                    | "shellexperiencehost.exe"
+                    | "searchhost.exe"
+                    | "searchapp.exe"
+                    | "searchui.exe"
+                    | "explorer.exe"
+            ) {
+                return false;
+            }
+        }
         let monitor = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
         if MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) != monitor {
             return false;
