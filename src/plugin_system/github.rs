@@ -31,6 +31,62 @@ struct Release {
     prerelease: bool,
     assets: Vec<Asset>,
 }
+#[derive(Deserialize)]
+struct MarketCatalog {
+    schema_version: u32,
+    repository_id: u64,
+    plugins: Vec<MarketEntry>,
+}
+#[derive(Deserialize)]
+struct MarketEntry {
+    #[serde(flatten)]
+    entry: CatalogEntry,
+    asset_id: u64,
+    download_url: String,
+    size: u64,
+    release_tag: String,
+}
+fn collect_market(source: &Source, catalog: MarketCatalog) -> Result<Vec<Candidate>> {
+    ensure!(catalog.schema_version == 2, "不支持的市场目录版本");
+    ensure!(
+        source.id == format!("github:{}", catalog.repository_id),
+        "市场目录仓库身份不匹配"
+    );
+    ensure!(catalog.plugins.len() <= 4096, "市场目录过大");
+    let mut ids = std::collections::HashSet::new();
+    let mut entries = vec![];
+    for item in catalog.plugins {
+        ensure!(ids.insert(item.entry.id.clone()), "市场目录包含重复插件 ID");
+        let tag = format!("{}/v{}", item.entry.id, item.entry.version);
+        ensure!(item.release_tag == tag, "插件发布标签与版本不一致");
+        let base = format!("https://github.com/{}/releases/download/", source.full_name);
+        ensure!(
+            item.download_url == format!("{base}{tag}/{}", item.entry.asset)
+                || item.download_url
+                    == format!("{base}{}/{}", tag.replace('/', "%2F"), item.entry.asset),
+            "插件下载地址与仓库、版本不一致"
+        );
+        ensure!(
+            item.asset_id != 0 && item.size > 0 && item.size <= 256 * 1024 * 1024,
+            "插件产物信息无效"
+        );
+        if item.entry.validate().is_err()
+            || !semver::Version::parse(&item.entry.version)?.pre.is_empty()
+        {
+            continue;
+        }
+        entries.push(Candidate {
+            entry: item.entry,
+            source: source.clone(),
+            asset_id: item.asset_id,
+            download_url: item.download_url,
+            size: item.size,
+            release_tag: tag,
+        });
+    }
+    entries.sort_by(|a, b| a.entry.name.cmp(&b.entry.name));
+    Ok(entries)
+}
 #[derive(Serialize, Deserialize)]
 struct Cache {
     at: u64,
@@ -142,6 +198,7 @@ pub fn catalog(paths: &Paths, source: &Source, force: bool) -> Result<Vec<Candid
         },
     };
     let mut releases = vec![];
+    let mut market = None;
     for page in 1..=10 {
         let batch: Vec<Release> = serde_json::from_slice(&request(
             &format!(
@@ -152,16 +209,31 @@ pub fn catalog(paths: &Paths, source: &Source, force: bool) -> Result<Vec<Candid
             8 * 1024 * 1024,
         )?)?;
         let done = batch.len() < 100;
+        if let Some(index) = batch
+            .iter()
+            .filter(|r| !r.draft && !r.prerelease)
+            .flat_map(|r| r.assets.iter())
+            .find(|a| a.name == "plugin-market.json")
+        {
+            ensure!(index.size <= 2 * 1024 * 1024, "市场目录过大");
+            let bytes = asset_bytes(&actual, index, 2 * 1024 * 1024)?;
+            market = Some(collect_market(&actual, serde_json::from_slice(&bytes)?)?);
+            break;
+        }
         releases.extend(batch);
         if done {
             break;
         }
     }
-    let entries = collect_releases(&actual, releases, |asset| {
-        ensure!(asset.size <= 2 * 1024 * 1024, "发布目录过大");
-        let bytes = asset_bytes(&actual, asset, 2 * 1024 * 1024)?;
-        Ok(serde_json::from_slice::<Catalog>(&bytes)?)
-    })?;
+    let entries = if let Some(entries) = market {
+        entries
+    } else {
+        collect_releases(&actual, releases, |asset| {
+            ensure!(asset.size <= 2 * 1024 * 1024, "发布目录过大");
+            let bytes = asset_bytes(&actual, asset, 2 * 1024 * 1024)?;
+            Ok(serde_json::from_slice::<Catalog>(&bytes)?)
+        })?
+    };
     let pending = file.with_extension("json.new");
     std::fs::write(
         &pending,
@@ -436,6 +508,52 @@ fn http(url: &str, limit: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn market_fixture() -> serde_json::Value {
+        serde_json::json!({"schema_version":2,"repository_id":1452116417,"plugins":[{
+            "id":"com.example.calendar","name":"Calendar","version":"1.0.0","platform":PLATFORM,
+            "host":">=1.0.0,<2.0.0","asset":"calendar.ubplugin","sha256":"a".repeat(64),
+            "asset_id":123,"size":64,"release_tag":"com.example.calendar/v1.0.0",
+            "download_url":"https://github.com/adoin/ultra-bar-plugins/releases/download/com.example.calendar/v1.0.0/calendar.ubplugin"
+        }]})
+    }
+    #[test]
+    fn market_snapshot_reuses_an_older_release_asset_without_attaching_it_again() {
+        let entries = collect_market(
+            &Source::official(),
+            serde_json::from_value(market_fixture()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].asset_id, 123);
+        assert_eq!(entries[0].release_tag, "com.example.calendar/v1.0.0");
+        assert!(
+            entries[0]
+                .download_url
+                .ends_with("/com.example.calendar/v1.0.0/calendar.ubplugin")
+        );
+    }
+    #[test]
+    fn market_rejects_foreign_sources_duplicate_ids_and_mismatched_versions() {
+        for field in ["repository_id", "download_url", "release_tag", "asset_id"] {
+            let mut value = market_fixture();
+            match field {
+                "repository_id" => value[field] = 1.into(),
+                "asset_id" => value["plugins"][0][field] = 0.into(),
+                "release_tag" => value["plugins"][0][field] = "com.example.calendar/v2.0.0".into(),
+                _ => value["plugins"][0][field] = "https://example.com/calendar.ubplugin".into(),
+            }
+            assert!(
+                collect_market(&Source::official(), serde_json::from_value(value).unwrap())
+                    .is_err()
+            );
+        }
+        let mut value = market_fixture();
+        let entry = value["plugins"][0].clone();
+        value["plugins"].as_array_mut().unwrap().push(entry);
+        assert!(
+            collect_market(&Source::official(), serde_json::from_value(value).unwrap()).is_err()
+        );
+    }
     #[test]
     fn releases_choose_latest_per_id_and_ignore_drafts_prereleases() {
         let source = Source::official();

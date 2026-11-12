@@ -12,7 +12,9 @@
 
 ## 线上目录
 
-打开仓库 tab 时按需读取 GitHub Releases，缓存 15 分钟；刷新按钮强制检查当前仓库，不做后台持续轮询。最多扫描最近 1000 个 Release。每个发布资产 `plugin-catalog.json`：
+打开仓库 tab 时按需读取 GitHub Releases，缓存 15 分钟；刷新按钮强制检查当前仓库，不做后台持续轮询。优先读取最近已发布的 `plugin-market.json`（schema 2）完整市场快照，其中每项包含下述单包元数据以及 `asset_id`、`release_tag`、`download_url`、`size`；顶层包含 `repository_id` 和源码 `revision`。包可来自同一仓库的历史 Release，无需复制到快照中。仓库身份、标签与版本、下载地址和 SHA-256 均校验。
+
+没有市场快照时，兼容扫描最近 1000 个 Release 的 `plugin-catalog.json`（schema 1）：
 
 ```json
 {
