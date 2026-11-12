@@ -58,6 +58,11 @@ pub struct Endpoint {
     id: u32,
     pid: u32,
 }
+impl Endpoint {
+    pub(super) fn menu_owner(&self) -> (HWND, u32) {
+        (self.owner as HWND, self.pid)
+    }
+}
 pub struct Icon(pub isize, std::sync::OnceLock<u64>);
 thread_local! {static FALLBACK_ICONS:std::cell::RefCell<std::collections::VecDeque<(String,Icon)>>=const{std::cell::RefCell::new(std::collections::VecDeque::new())};}
 unsafe fn executable_icon(path: &str) -> HICON {

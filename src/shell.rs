@@ -2773,6 +2773,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                     return 0;
                 }
                 if let Some(Action::TrayIcon(key)) = hit_action(state, x, y) {
+                    if let Some(popup) = &mut state.tray_popup {
+                        popup.context_click(&key);
+                    }
                     if let Some(host) = &state.tray_host {
                         host.send(tray::Command::Click(key, tray::Click::Right));
                     }

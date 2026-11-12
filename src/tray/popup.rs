@@ -32,6 +32,8 @@ struct Hit {
 struct State {
     hover: super::Hover,
     cancelled_click: bool,
+    context: Option<super::context_menu::Handoff>,
+    hold_inactive: bool,
     drag: Option<(String, POINT, bool)>,
     ghost: Option<super::drag_image::Ghost>,
     drop_target: bool,
@@ -67,6 +69,13 @@ impl Drop for Popup {
 }
 
 impl Popup {
+    pub unsafe fn context_click(&mut self, key: &str) {
+        unsafe {
+            if IsWindowVisible(self.state.hwnd) != 0 {
+                arm_context(&mut self.state, key);
+            }
+        }
+    }
     pub unsafe fn drag_feedback(&mut self, point: POINT) {
         unsafe {
             let active = self.contains(point);
@@ -129,6 +138,8 @@ impl Popup {
             let mut state = Box::new(State {
                 hover: super::Hover::default(),
                 cancelled_click: false,
+                context: None,
+                hold_inactive: false,
                 drag: None,
                 ghost: None,
                 drop_target: false,
@@ -300,6 +311,26 @@ unsafe fn position(state: &mut State) {
     }
 }
 
+unsafe fn arm_context(state: &mut State, key: &str) {
+    unsafe {
+        KillTimer(state.hwnd, 11);
+        let (owner, pid) = state
+            .snapshot
+            .items
+            .iter()
+            .find(|item| item.key == key)
+            .map(|item| item.endpoint.menu_owner())
+            .unwrap_or((state.owner, std::process::id()));
+        state.context = Some(super::context_menu::Handoff::new(owner, pid, state.hwnd));
+        state.hold_inactive = true;
+        SetTimer(state.hwnd, super::context_menu::TIMER, 60, None);
+        ultra_bar_native_ui::diagnostics::event(
+            "tray",
+            "context.handoff",
+            serde_json::json!({"pid":pid}),
+        );
+    }
+}
 unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
         if crate::visual::theme::handle_message(hwnd, message, w) {
@@ -342,12 +373,52 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
             }
             WM_TIMER if w == 11 => {
                 KillTimer(hwnd, 11);
-                ShowWindow(hwnd, SW_HIDE);
+                if !state.hold_inactive && state.context.is_none() {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
+                0
+            }
+            WM_TIMER if w == super::context_menu::TIMER => {
+                use super::context_menu::Decision;
+                let decision = state.context.as_mut().map(|session| session.tick());
+                match decision {
+                    Some(Decision::Wait) => {}
+                    Some(Decision::Resume) => {
+                        KillTimer(hwnd, super::context_menu::TIMER);
+                        state.context = None;
+                        state.hold_inactive = GetForegroundWindow() != hwnd;
+                        let mut track = TRACKMOUSEEVENT {
+                            cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                            dwFlags: TME_LEAVE,
+                            hwndTrack: hwnd,
+                            dwHoverTime: 0,
+                        };
+                        TrackMouseEvent(&mut track);
+                    }
+                    Some(Decision::Hide) => {
+                        ultra_bar_native_ui::diagnostics::event(
+                            "tray",
+                            "context.closed",
+                            serde_json::json!({"menu_observed":state.context.as_ref().is_some_and(|s|s.observed())}),
+                        );
+                        KillTimer(hwnd, super::context_menu::TIMER);
+                        ShowWindow(hwnd, SW_HIDE);
+                    }
+                    None => {
+                        KillTimer(hwnd, super::context_menu::TIMER);
+                    }
+                }
+                0
+            }
+            WM_ACTIVATE if w & 0xffff != WA_INACTIVE as usize => {
+                state.hold_inactive = false;
                 0
             }
             WM_ACTIVATE if w & 0xffff == WA_INACTIVE as usize && state.drag.is_none() => {
                 KillTimer(hwnd, 11);
-                ShowWindow(hwnd, SW_HIDE);
+                if !state.hold_inactive && state.context.is_none() {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
                 0
             }
             WM_CLOSE => {
@@ -374,6 +445,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_LBUTTONDOWN => {
+                state.context = None;
+                state.hold_inactive = false;
+                KillTimer(hwnd, super::context_menu::TIMER);
                 state.hover.leave(&state.sender);
                 state.cancelled_click = false;
                 KillTimer(hwnd, 11);
@@ -461,9 +535,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
             }
             WM_MOUSELEAVE => {
                 state.hover.leave(&state.sender);
+                if state.hold_inactive && state.context.is_none() {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
                 0
             }
             WM_SHOWWINDOW if w == 0 => {
+                state.context = None;
+                state.hold_inactive = false;
+                KillTimer(hwnd, super::context_menu::TIMER);
                 state.drop_target = false;
                 state.ghost = None;
                 state.hover.leave(&state.sender);
@@ -485,6 +565,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_LBUTTONUP | WM_RBUTTONUP | WM_LBUTTONDBLCLK => {
+                if message == WM_RBUTTONUP
+                    && state.drag.as_ref().is_some_and(|(_, _, active)| *active)
+                {
+                    state.cancelled_click = true;
+                    state.drag = None;
+                    state.ghost = None;
+                    if GetCapture() == hwnd {
+                        ReleaseCapture();
+                    }
+                    return 0;
+                }
                 state.ghost = None;
                 state.hover.leave(&state.sender);
                 if message == WM_LBUTTONUP && state.cancelled_click {
@@ -524,6 +615,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                         Action::Icon(key) => {
                             if message == WM_LBUTTONUP {
                                 SetTimer(hwnd, 11, GetDoubleClickTime() + 100, None);
+                            } else if message == WM_RBUTTONUP {
+                                arm_context(state, &key);
                             } else {
                                 KillTimer(hwnd, 11);
                                 ShowWindow(hwnd, SW_HIDE);
@@ -833,6 +926,110 @@ mod tests {
             SendMessageW(popup.state.hwnd, WM_LBUTTONUP, 0, point(10, 10));
             assert!(
                 matches!(receiver.try_recv(),Ok(Command::Click(key,Click::Left)) if key=="test-icon")
+            );
+            SetWindowPos(
+                popup.state.hwnd,
+                HWND_TOP,
+                -32000,
+                -32000,
+                80,
+                80,
+                SWP_NOACTIVATE,
+            );
+            ShowWindow(popup.state.hwnd, SW_SHOWNOACTIVATE);
+            popup.state.hits = vec![Hit {
+                rect: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 40,
+                    bottom: 40,
+                },
+                action: Action::Icon("test-icon".into()),
+                label: "Test icon".into(),
+            }];
+            SendMessageW(popup.state.hwnd, WM_RBUTTONUP, 0, point(10, 10));
+            assert!(
+                matches!(receiver.try_recv(),Ok(Command::Click(key,Click::Right)) if key=="test-icon")
+            );
+            assert_ne!(
+                IsWindowVisible(popup.state.hwnd),
+                0,
+                "right click must retain the flyout"
+            );
+            SendMessageW(popup.state.hwnd, WM_TIMER, 11, 0);
+            SendMessageW(popup.state.hwnd, WM_ACTIVATE, WA_INACTIVE as usize, 0);
+            assert_ne!(
+                IsWindowVisible(popup.state.hwnd),
+                0,
+                "menu focus or a queued left-click timer closed the flyout"
+            );
+            let menu_class = wide("UltraBar.TrayMenuTest.Popup");
+            RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(DefWindowProcW),
+                hInstance: instance,
+                lpszClassName: menu_class.as_ptr(),
+                ..zeroed()
+            });
+            let menu = CreateWindowExW(
+                WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                menu_class.as_ptr(),
+                wide("menu").as_ptr(),
+                WS_POPUP | WS_VISIBLE,
+                -32000,
+                -32000,
+                80,
+                80,
+                owner,
+                null_mut(),
+                instance,
+                null(),
+            );
+            assert!(!menu.is_null());
+            SendMessageW(
+                popup.state.hwnd,
+                WM_TIMER,
+                super::super::context_menu::TIMER,
+                0,
+            );
+            assert_ne!(
+                IsWindowVisible(popup.state.hwnd),
+                0,
+                "native popup handoff must retain the flyout"
+            );
+            assert!(popup.state.context.as_ref().unwrap().observed());
+            ShowWindow(menu, SW_HIDE);
+            popup.state.context.as_mut().unwrap().expire_for_test();
+            SendMessageW(
+                popup.state.hwnd,
+                WM_TIMER,
+                super::super::context_menu::TIMER,
+                0,
+            );
+            assert_eq!(
+                IsWindowVisible(popup.state.hwnd),
+                0,
+                "ended context session must dismiss outside the flyout"
+            );
+            assert!(popup.state.context.is_none());
+            DestroyWindow(menu);
+            UnregisterClassW(menu_class.as_ptr(), instance);
+            ShowWindow(popup.state.hwnd, SW_SHOWNOACTIVATE);
+            SendMessageW(
+                popup.state.hwnd,
+                WM_TIMER,
+                super::super::context_menu::TIMER,
+                0,
+            );
+            assert_ne!(
+                IsWindowVisible(popup.state.hwnd),
+                0,
+                "stale context timer closed a reopened flyout"
+            );
+            SendMessageW(popup.state.hwnd, WM_ACTIVATE, WA_INACTIVE as usize, 0);
+            assert_eq!(
+                IsWindowVisible(popup.state.hwnd),
+                0,
+                "normal outside dismissal must remain functional"
             );
             drop(popup);
             DestroyWindow(owner);

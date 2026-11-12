@@ -1,3 +1,4 @@
+mod context_menu;
 pub mod drag_image;
 mod hover;
 mod hover_popup;
