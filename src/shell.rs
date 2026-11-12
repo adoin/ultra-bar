@@ -142,6 +142,7 @@ struct State {
     tray_ghost: Option<tray::drag_image::Ghost>,
     fullscreen_hidden: bool,
     native_fullscreen: Option<usize>,
+    fullscreen_windows: Vec<(usize, u32)>,
     tray_rect: RECT,
     isolated: bool,
     hwnd: HWND,
@@ -286,6 +287,7 @@ pub fn run(options: Options) -> Result<()> {
             tray_ghost: None,
             fullscreen_hidden: false,
             native_fullscreen: None,
+            fullscreen_windows: vec![],
             tray_rect: zeroed(),
             isolated: options.isolated,
             hwnd: null_mut(),
@@ -651,6 +653,7 @@ unsafe fn refresh_fullscreen(state: &mut State) {
             if let Some(host) = &state.tray_host {
                 state.tray_hover.leave(&host.sender);
             }
+            state.fullscreen_windows = crate::fullscreen::hide_owned(state.hwnd);
             ShowWindow(state.hwnd, SW_HIDE);
         } else {
             SetWindowPos(
@@ -661,6 +664,10 @@ unsafe fn refresh_fullscreen(state: &mut State) {
                 0,
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            crate::fullscreen::restore_owned(
+                state.hwnd,
+                std::mem::take(&mut state.fullscreen_windows),
             );
         }
         ultra_bar_native_ui::diagnostics::event(
