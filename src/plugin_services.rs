@@ -22,6 +22,43 @@ use windows_sys::Win32::{
 };
 
 struct Job(isize);
+#[cfg(test)]
+mod cpu_budget_tests {
+    use super::*;
+    #[test]
+    fn nested_limits_keep_the_intended_budget_instead_of_multiplying_percentages() {
+        assert_eq!(relative_cpu(10, 20), 50);
+        assert_eq!(relative_cpu(5, 10), 50);
+        assert_eq!(20 * relative_cpu(10, 20) * relative_cpu(5, 10) / 10000, 5);
+        for parent in 1..=100 {
+            let global = parent.min(10);
+            assert!(parent * relative_cpu(10, parent) / 100 <= 10);
+            assert!(global * relative_cpu(5, global) / 100 <= 5);
+        }
+    }
+}
+fn relative_cpu(desired: u32, parent: u32) -> u32 {
+    (desired * 100 / parent.max(1)).clamp(1, 100)
+}
+fn inherited_cpu() -> u32 {
+    unsafe {
+        let mut rate: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = zeroed();
+        if QueryInformationJobObject(
+            std::ptr::null_mut(),
+            JobObjectCpuRateControlInformation,
+            (&mut rate as *mut JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
+            size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as _,
+            std::ptr::null_mut(),
+        ) != 0
+            && rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_ENABLE != 0
+            && rate.ControlFlags & JOB_OBJECT_CPU_RATE_CONTROL_WEIGHT_BASED == 0
+        {
+            rate.Anonymous.CpuRate.div_ceil(100).clamp(1, 100)
+        } else {
+            100
+        }
+    }
+}
 impl Drop for Job {
     fn drop(&mut self) {
         unsafe {
@@ -87,9 +124,16 @@ struct Worker {
     flip: Option<Instant>,
     started: Instant,
     retries: u8,
+    settings: bool,
+    exit_logged: bool,
 }
 impl Drop for Worker {
     fn drop(&mut self) {
+        ultra_bar_native_ui::diagnostics::event(
+            "plugins",
+            "service.stop_requested",
+            serde_json::json!({"pid":self.child.id(),"binary":self.binary}),
+        );
         let _ = self.input.try_send(HostEvent::Shutdown);
         // A bounded grace period preserves orderly flushing, then only this owned job is closed.
         let end = Instant::now() + Duration::from_millis(150);
@@ -101,19 +145,27 @@ impl Drop for Worker {
     }
 }
 impl Worker {
-    fn start(widget: &Widget, owner: isize, global: isize) -> Result<Self> {
+    fn start(widget: &Widget, owner: isize, global: isize, global_cpu: u32) -> Result<Self> {
         let binary = widget
             .panel
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("插件尚未构建"))?;
-        let job = Job::new(5, 384 * 1024 * 1024)?;
+        let job = Job::new(relative_cpu(5, global_cpu), 384 * 1024 * 1024)?;
         let mut child = Command::new(binary)
             .args(["--service", "--owner", &owner.to_string()])
             .current_dir(&widget.root)
             .env("ULTRA_BAR_ACCENT", theme::hex(theme::accent_rgb()))
+            .env(
+                "ULTRA_BAR_LOG_DIR",
+                ultra_bar_native_ui::diagnostics::root().unwrap_or(Path::new("logs")),
+            )
+            .env(
+                "ULTRA_BAR_PARENT_SESSION",
+                ultra_bar_native_ui::diagnostics::session().unwrap_or(""),
+            )
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .creation_flags(CREATE_NO_WINDOW | BELOW_NORMAL_PRIORITY_CLASS)
             .spawn()?;
         // SDK services wait for Initialize before doing any work. No auth or scanning during startup.
@@ -127,6 +179,45 @@ impl Worker {
         }
         let mut stdin = child.stdin.take().unwrap();
         let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let diagnostic_id = widget.id.clone();
+        let diagnostic_pid = child.id();
+        ultra_bar_native_ui::diagnostics::event(
+            "plugins",
+            "service.start",
+            serde_json::json!({"id":widget.id,"pid":child.id(),"binary":binary}),
+        );
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut reader = BufReader::new(stderr);
+            let mut line = Vec::new();
+            loop {
+                let chunk = match reader.fill_buf() {
+                    Ok(chunk) if !chunk.is_empty() => chunk,
+                    _ => break,
+                };
+                let end = chunk.iter().position(|b| *b == b'\n');
+                let count = end.map_or(chunk.len(), |n| n + 1);
+                let remaining = 8192usize.saturating_sub(line.len());
+                line.extend_from_slice(&chunk[..count.min(remaining)]);
+                reader.consume(count);
+                if end.is_some() {
+                    ultra_bar_native_ui::diagnostics::event(
+                        "plugins",
+                        "service.stderr",
+                        serde_json::json!({"id":diagnostic_id,"pid":diagnostic_pid,"message":String::from_utf8_lossy(&line)}),
+                    );
+                    line.clear();
+                }
+            }
+            if !line.is_empty() {
+                ultra_bar_native_ui::diagnostics::event(
+                    "plugins",
+                    "service.stderr",
+                    serde_json::json!({"id":diagnostic_id,"pid":diagnostic_pid,"message":String::from_utf8_lossy(&line)}),
+                );
+            }
+        });
         let (input, receive) = mpsc::sync_channel(16);
         let (send, output) = mpsc::sync_channel(8);
         std::thread::spawn(move || {
@@ -154,6 +245,7 @@ impl Worker {
         std::fs::create_dir_all(&data)?;
         input.try_send(HostEvent::Initialize {
             protocol: 1,
+            host: owner as usize,
             id: widget.id.clone(),
             data_dir: data.to_string_lossy().into_owned(),
             accent: theme::hex(theme::accent_rgb()),
@@ -170,6 +262,8 @@ impl Worker {
             flip: None,
             started: Instant::now(),
             retries: 0,
+            settings: false,
+            exit_logged: false,
         })
     }
 }
@@ -179,11 +273,18 @@ pub struct Manager {
     global_job: Option<Job>,
     foreground: (String, String),
     accent: String,
+    global_cpu: u32,
 }
 impl Manager {
+    pub fn diagnostics(&mut self) -> serde_json::Value {
+        let workers:Vec<_>=self.workers.iter_mut().map(|(id,worker)|serde_json::json!({"id":id,"pid":worker.child.id(),"exited":worker.child.try_wait().ok().flatten().map(|s|s.code()),"retries":worker.retries,"pages":worker.pages})).collect();
+        serde_json::json!({"foreground_executable":self.foreground.0,"workers":workers})
+    }
     pub fn sync(&mut self, widgets: &[Widget], owner: isize) {
         if self.global_job.is_none() && widgets.iter().any(|w| w.service) {
-            match Job::new(10, 1024 * 1024 * 1024) {
+            let parent = inherited_cpu();
+            self.global_cpu = parent.min(10);
+            match Job::new(relative_cpu(10, parent), 1024 * 1024 * 1024) {
                 Ok(job) => self.global_job = Some(job),
                 Err(e) => {
                     eprintln!("[service] {e}");
@@ -198,7 +299,12 @@ impl Manager {
         });
         for w in widgets.iter().filter(|w| w.service && w.panel.is_some()) {
             if !self.workers.contains_key(&w.id) {
-                match Worker::start(w, owner, self.global_job.as_ref().unwrap().0) {
+                match Worker::start(
+                    w,
+                    owner,
+                    self.global_job.as_ref().unwrap().0,
+                    self.global_cpu,
+                ) {
                     Ok(worker) => {
                         self.workers.insert(w.id.clone(), worker);
                         self.foreground = (String::new(), String::new());
@@ -209,11 +315,45 @@ impl Manager {
         }
     }
     pub fn show(&self, id: &str) -> Result<()> {
-        self.workers
+        let worker = self
+            .workers
             .get(id)
-            .ok_or_else(|| anyhow::anyhow!("后台插件未启动"))?
-            .input
-            .try_send(HostEvent::Show)?;
+            .ok_or_else(|| anyhow::anyhow!("后台插件未启动"))?;
+        unsafe {
+            AllowSetForegroundWindow(worker.child.id());
+        }
+        worker.input.try_send(HostEvent::Show)?;
+        Ok(())
+    }
+    pub fn configure(&self, id: &str) -> Result<()> {
+        let worker = self
+            .workers
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("后台插件未启动"))?;
+        ensure!(worker.settings, "此插件未提供设置入口");
+        unsafe {
+            AllowSetForegroundWindow(worker.child.id());
+        }
+        worker.input.try_send(HostEvent::Settings)?;
+        Ok(())
+    }
+    pub fn save_settings(&self, id: &str, revision: u64, values: Vec<String>) -> Result<()> {
+        ultra_bar_native_ui::diagnostics::event(
+            "settings",
+            "plugin.save_requested",
+            serde_json::json!({"id":id,"revision":revision,"field_count":values.len()}),
+        );
+        let worker = self
+            .workers
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("后台插件未启动"))?;
+        ensure!(worker.settings, "此插件未提供设置入口");
+        let event = HostEvent::SettingsValues { revision, values };
+        ensure!(
+            serde_json::to_vec(&event)?.len() < ultra_bar_plugin_sdk::MAX_LINE,
+            "设置内容过长"
+        );
+        worker.input.try_send(event)?;
         Ok(())
     }
     pub fn page(&self, id: &str) -> Option<(&Page, Option<&Page>, f64)> {
@@ -252,15 +392,28 @@ impl Manager {
             let Some(worker) = self.workers.get_mut(&w.id) else {
                 continue;
             };
+            if let Ok(Some(status)) = worker.child.try_wait()
+                && !worker.exit_logged
+            {
+                worker.exit_logged = true;
+                ultra_bar_native_ui::diagnostics::event(
+                    "plugins",
+                    "service.exit",
+                    serde_json::json!({"id":w.id,"pid":worker.child.id(),"exit_code":status.code(),"retries":worker.retries}),
+                );
+            }
             if worker.child.try_wait().ok().flatten().is_some()
                 && worker.retries < 3
                 && worker.started.elapsed().as_secs() >= 5u64 << worker.retries
             {
                 let retries = worker.retries + 1;
                 worker.retries = retries;
-                if let Ok(mut replacement) =
-                    Worker::start(w, owner, self.global_job.as_ref().unwrap().0)
-                {
+                if let Ok(mut replacement) = Worker::start(
+                    w,
+                    owner,
+                    self.global_job.as_ref().unwrap().0,
+                    self.global_cpu,
+                ) {
                     replacement.retries = retries;
                     *worker = replacement;
                     changed = true;
@@ -282,6 +435,9 @@ impl Manager {
                     break;
                 };
                 match event {
+                    PluginEvent::Capabilities { settings } => {
+                        worker.settings = settings;
+                    }
                     PluginEvent::Ready => {
                         if w.foreground_events {
                             let _ = worker.input.try_send(HostEvent::Foreground {
@@ -352,8 +508,9 @@ pub fn smoke(directory: &Path) -> Result<()> {
         widgets.iter().all(|w| w.panel.is_some()),
         "Build native plugins first"
     );
+    let mut provider = unsafe { crate::editors::TestProvider::new(&widgets)? };
     let mut manager = Manager::default();
-    manager.sync(&widgets, 0);
+    manager.sync(&widgets, provider.hwnd as isize);
     ensure!(
         manager.workers.len() == 2,
         "Both service processes must start"
@@ -369,7 +526,7 @@ pub fn smoke(directory: &Path) -> Result<()> {
     for i in 0..10 {
         manager.poll(
             &widgets,
-            0,
+            provider.hwnd as isize,
             if multiple && i == 2 {
                 "Claude.exe"
             } else {
@@ -382,9 +539,28 @@ pub fn smoke(directory: &Path) -> Result<()> {
         if i == 6 {
             before = manager.cpu_time();
         }
-        std::thread::sleep(Duration::from_secs(1));
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(1) {
+            unsafe {
+                provider.pump();
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
-    manager.poll(&widgets, 0, "Codex.exe".into(), "Codex".into());
+    manager.poll(
+        &widgets,
+        provider.hwnd as isize,
+        "Codex.exe".into(),
+        "Codex".into(),
+    );
+    unsafe {
+        provider.verify_mount(directory)?;
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(1) {
+            provider.pump();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     let idle_cpu_cores = (manager.cpu_time() - before) as f64 / 10_000_000.0 / 4.0;
     let pages: Vec<_> = manager
         .workers
@@ -398,6 +574,7 @@ pub fn smoke(directory: &Path) -> Result<()> {
             "Multiple active agents did not rotate"
         );
     }
+    provider.close_mounts();
     drop(manager);
     let mut remaining = Vec::new();
     for pid in pids {
@@ -448,11 +625,22 @@ impl Manager {
     }
 }
 fn open_external(path: &str, select_parent: bool) -> Result<()> {
+    ultra_bar_native_ui::diagnostics::event(
+        "input",
+        "file.open_requested",
+        serde_json::json!({"path":path,"select_parent":select_parent}),
+    );
     ensure!(
-        Path::new(path).is_absolute() && !path.contains('\0'),
+        (Path::new(path).is_absolute() || packaged_app_target(path)) && !path.contains('\0'),
         "Invalid file path"
     );
     let mut command = Command::new(std::env::current_exe()?);
+    if let Some(root) = ultra_bar_native_ui::diagnostics::root() {
+        command.env("ULTRA_BAR_LOG_DIR", root);
+    }
+    if let Some(session) = ultra_bar_native_ui::diagnostics::session() {
+        command.env("ULTRA_BAR_PARENT_SESSION", session);
+    }
     command.args(["--shell-open", path]);
     if select_parent {
         command.arg("--select-parent");
@@ -463,9 +651,26 @@ fn open_external(path: &str, select_parent: bool) -> Result<()> {
         .spawn()?;
     Ok(())
 }
+fn packaged_app_target(path: &str) -> bool {
+    let Some(id) = path.strip_prefix("shell:AppsFolder\\") else {
+        return false;
+    };
+    let Some((package, app)) = id.split_once('!') else {
+        return false;
+    };
+    id.len() <= 512
+        && package.contains('_')
+        && !app.is_empty()
+        && !app.contains('!')
+        && id
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-' | b'!'))
+}
 pub fn shell_open(path: &str, select_parent: bool) -> Result<()> {
     ensure!(
-        Path::new(path).is_absolute() && !path.contains('\0') && !path.contains('"'),
+        (Path::new(path).is_absolute() || packaged_app_target(path))
+            && !path.contains('\0')
+            && !path.contains('"'),
         "Invalid file path"
     );
     unsafe {
@@ -491,4 +696,24 @@ pub fn shell_open(path: &str, select_parent: bool) -> Result<()> {
         ensure!(result as isize > 32, "无法打开文件");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod app_target_tests {
+    use super::*;
+    #[test]
+    fn allows_only_a_single_packaged_app_target() {
+        assert!(packaged_app_target(
+            "shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App"
+        ));
+        for bad in [
+            "shell:startup",
+            "shell:AppsFolder\\App",
+            "shell:AppsFolder\\P_x!App /arg",
+            "shell:AppsFolder\\P_x!App\\..",
+            "shell:AppsFolder\\P_x!App!Other",
+        ] {
+            assert!(!packaged_app_target(bad));
+        }
+    }
 }

@@ -4,6 +4,9 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }
+    // Extra virtual reserve for legitimate Shell/COM callback nesting; pages are
+    // committed on demand. Re-entry suppression remains the primary safeguard.
+    println!("cargo:rustc-link-arg-bin=ultra-bar=/STACK:4194304");
     let sdk = PathBuf::from(env::var_os("ProgramFiles(x86)").expect("Windows SDK required"))
         .join("Windows Kits/10/bin");
     let mut versions: Vec<_> = fs::read_dir(sdk)

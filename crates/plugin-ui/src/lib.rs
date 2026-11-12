@@ -1,4 +1,5 @@
 //! Event-driven glass panel shared by service plugins. Backend work never runs on the UI thread.
+pub mod statistics;
 use std::{
     io::BufReader,
     mem::zeroed,
@@ -12,13 +13,15 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
     System::LibraryLoader::*,
-    UI::{HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
+    UI::{HiDpi::*, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
 };
 pub enum Command {
+    Editor(ultra_bar_plugin_sdk::editors::EditorEvent),
     Host(HostEvent),
     Query(String),
     Refresh,
     SettingsSaved(Vec<String>),
+    Ignored,
 }
 #[derive(Clone, Default)]
 pub struct Row {
@@ -28,15 +31,88 @@ pub struct Row {
 }
 #[derive(Clone)]
 pub struct Panel {
+    pending_settings: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    data: std::sync::Arc<std::sync::OnceLock<std::path::PathBuf>>,
+    owner: isize,
+    statistics: SyncSender<statistics::Dataset>,
     hwnd: isize,
     output: SyncSender<(Vec<Row>, String)>,
     settings: SyncSender<Vec<ultra_bar_native_ui::form::Field>>,
 }
 impl Panel {
+    pub fn editor(&self, operation: ultra_bar_plugin_sdk::editors::Operation) {
+        let data = Box::into_raw(Box::new(operation));
+        unsafe {
+            if PostMessageW(self.hwnd as HWND, WM_APP + 19, 0, data as isize) == 0 {
+                drop(Box::from_raw(data));
+            }
+        }
+    }
+
+    pub fn visible(&self) -> bool {
+        unsafe { IsWindowVisible(self.hwnd as _) != 0 }
+    }
+    pub fn statistics(&self, data: statistics::Dataset) {
+        let _ = self.statistics.try_send(data);
+        unsafe {
+            PostMessageW(self.hwnd as _, WM_APP + 6, 0, 0);
+        }
+    }
     pub fn settings(&self, fields: Vec<ultra_bar_native_ui::form::Field>) {
+        if let Some(data) = self.data.get() {
+            let ack = self
+                .pending_settings
+                .swap(0, std::sync::atomic::Ordering::SeqCst);
+            if let Err(error) = ultra_bar_native_ui::settings_bridge::publish_ack(
+                data,
+                self.owner,
+                fields.clone(),
+                String::new(),
+                (ack != 0).then_some(ack),
+            ) {
+                eprintln!("[settings] {error}");
+            }
+        }
+        let _ = send(&PluginEvent::Capabilities {
+            settings: !fields.is_empty(),
+        });
         let _ = self.settings.try_send(fields);
         unsafe {
             PostMessageW(self.hwnd as _, WM_APP + 5, 0, 0);
+        }
+    }
+    pub fn settings_error(&self, error: impl Into<String>) {
+        if let Some(data) = self.data.get() {
+            let ack = self
+                .pending_settings
+                .swap(0, std::sync::atomic::Ordering::SeqCst);
+            let _ = ultra_bar_native_ui::settings_bridge::error_ack(
+                data,
+                self.owner,
+                error.into(),
+                (ack != 0).then_some(ack),
+            );
+        }
+    }
+    pub fn settings_command(&self, command: Command) -> Command {
+        if let Command::Host(HostEvent::SettingsValues { revision, values }) = command {
+            self.pending_settings
+                .store(revision, std::sync::atomic::Ordering::SeqCst);
+            if self
+                .data
+                .get()
+                .and_then(|p| ultra_bar_native_ui::settings_bridge::load(p).ok())
+                .is_some_and(|s| s.revision == revision)
+                && values.len() <= 32
+                && values.iter().all(|v| v.len() <= 65536)
+            {
+                Command::SettingsSaved(values)
+            } else {
+                self.settings_error("设置已在其他位置更改，请重新载入后再保存");
+                Command::Ignored
+            }
+        } else {
+            command
         }
     }
     pub fn update(&self, rows: Vec<Row>, status: impl Into<String>) {
@@ -47,6 +123,9 @@ impl Panel {
     }
 }
 struct State {
+    popover: ultra_bar_native_ui::popover::Popover,
+    dashboard: Option<statistics::View>,
+    statistics_rx: Receiver<statistics::Dataset>,
     settings: Vec<ultra_bar_native_ui::form::Field>,
     settings_rx: Receiver<Vec<ultra_bar_native_ui::form::Field>>,
     tips: Option<Tooltips>,
@@ -61,18 +140,30 @@ struct State {
     rows: Vec<Row>,
     status: String,
     selected: usize,
+    context: Option<(i32, i32)>,
     scroll: usize,
     search: bool,
+    host: HWND,
+    plugin_id: String,
 }
 pub fn run(
     title: &str,
     search: bool,
     backend: impl FnOnce(Panel, Receiver<Command>) + Send + 'static,
 ) -> anyhow::Result<()> {
+    let _logs = ultra_bar_native_ui::diagnostics::init(
+        if search {
+            "search-service"
+        } else {
+            "service-ui"
+        },
+        env!("CARGO_PKG_VERSION"),
+    )?;
     theme::init_from_env();
     let (input, commands) = mpsc::sync_channel(32);
     let (output, receive) = mpsc::sync_channel(4);
     let (settings, settings_rx) = mpsc::sync_channel(2);
+    let (statistics, statistics_rx) = mpsc::sync_channel(2);
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let module = GetModuleHandleW(null());
@@ -116,6 +207,9 @@ pub fn run(
             )
         };
         let mut state = Box::new(State {
+            popover: Default::default(),
+            dashboard: None,
+            statistics_rx,
             settings: vec![],
             settings_rx,
             tips: None,
@@ -130,8 +224,11 @@ pub fn run(
             rows: vec![],
             status: String::new(),
             selected: 0,
+            context: None,
             scroll: 0,
             search,
+            host: null_mut(),
+            plugin_id: String::new(),
         });
         let hwnd = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
@@ -164,35 +261,16 @@ pub fn run(
             ),
             1,
         );
-        if search {
-            state.edit = CreateWindowExW(
-                0,
-                wide("EDIT").as_ptr(),
-                wide("").as_ptr(),
-                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32,
-                22 * dpi / 96,
-                48 * dpi / 96,
-                476 * dpi / 96,
-                30 * dpi / 96,
-                hwnd,
-                1usize as _,
-                module,
-                null(),
-            );
-            SendMessageW(state.edit, WM_SETFONT, state.font as usize, 1);
-            SendMessageW(
-                state.edit,
-                0x1501,
-                0,
-                wide("搜索文件或文件夹…").as_ptr() as isize,
-            );
-            SetWindowSubclass(state.edit, Some(edit_proc), 1, 0);
-        }
         let panel = Panel {
+            pending_settings: Default::default(),
+            data: Default::default(),
+            owner: owner as isize,
+            statistics,
             hwnd: hwnd as isize,
             output,
             settings,
         };
+        let settings_data = panel.data.clone();
         std::thread::spawn(move || backend(panel, commands));
         let target = hwnd as isize;
         std::thread::spawn(move || {
@@ -200,6 +278,11 @@ pub fn run(
             let mut initialized = false;
             while let Ok(Some(line)) = ultra_bar_plugin_sdk::read_line(&mut reader) {
                 let Ok(event) = serde_json::from_str::<HostEvent>(&line) else {
+                    ultra_bar_native_ui::diagnostics::event(
+                        "plugins",
+                        "protocol.invalid",
+                        serde_json::json!({"line_bytes":line.len()}),
+                    );
                     break;
                 };
                 if !initialized {
@@ -207,12 +290,31 @@ pub fn run(
                         break;
                     }
                     initialized = true;
+                    if let HostEvent::Initialize { host, id, .. } = &event {
+                        let data = Box::new((*host, id.clone()));
+                        PostMessageW(target as _, WM_APP + 18, 0, Box::into_raw(data) as isize);
+                    }
+                    if let HostEvent::Initialize { id, protocol, .. } = &event {
+                        ultra_bar_native_ui::diagnostics::event(
+                            "plugins",
+                            "initialized",
+                            serde_json::json!({"id":id,"protocol":protocol}),
+                        );
+                    }
+                    if let HostEvent::Initialize { data_dir, .. } = &event {
+                        let _ = settings_data.set(data_dir.into());
+                    }
                 } else if matches!(event, HostEvent::Initialize { .. }) {
                     break;
                 }
                 match &event {
+                    HostEvent::Settings => {
+                        PostMessageW(target as _, WM_APP + 7, 0, 0);
+                        continue;
+                    }
                     HostEvent::Show => {
                         PostMessageW(target as _, WM_APP + 2, 0, 0);
+                        continue;
                     }
                     HostEvent::Shutdown => break,
                     HostEvent::Theme { accent } => {
@@ -241,21 +343,6 @@ pub fn run(
     }
     Ok(())
 }
-unsafe extern "system" fn edit_proc(
-    hwnd: HWND,
-    msg: u32,
-    w: usize,
-    l: isize,
-    _: usize,
-    _: usize,
-) -> LRESULT {
-    unsafe {
-        if msg == WM_KEYDOWN && matches!(w as u16, VK_RETURN | VK_ESCAPE | VK_UP | VK_DOWN) {
-            return SendMessageW(GetParent(hwnd), msg, w, l);
-        }
-        DefSubclassProc(hwnd, msg, w, l)
-    }
-}
 unsafe fn open(state: &State, parent: bool) {
     if let Some(path) = state.rows.get(state.selected).and_then(|r| r.path.as_ref()) {
         let _ = send(&PluginEvent::Open {
@@ -264,16 +351,70 @@ unsafe fn open(state: &State, parent: bool) {
         });
     }
 }
+unsafe fn copy_path(state: &mut State, hwnd: HWND) {
+    unsafe {
+        use windows_sys::Win32::System::{DataExchange::*, Memory::*};
+        let Some(path) = state.rows.get(state.selected).and_then(|r| r.path.as_ref()) else {
+            return;
+        };
+        let value = wide(path);
+        let memory = GlobalAlloc(GMEM_MOVEABLE, value.len() * 2);
+        if memory.is_null() {
+            state.status = "无法分配剪贴板内存".into();
+            return;
+        }
+        let target = GlobalLock(memory) as *mut u16;
+        if target.is_null() {
+            GlobalFree(memory);
+            state.status = "无法写入剪贴板".into();
+            return;
+        }
+        std::ptr::copy_nonoverlapping(value.as_ptr(), target, value.len());
+        GlobalUnlock(memory);
+        if OpenClipboard(hwnd) == 0 {
+            GlobalFree(memory);
+            state.status = "剪贴板正忙，请重试".into();
+            return;
+        }
+        if EmptyClipboard() != 0 && !SetClipboardData(13, memory).is_null() {
+            state.status = "已复制完整路径".into();
+        } else {
+            GlobalFree(memory);
+            state.status = "无法写入剪贴板".into();
+        }
+        CloseClipboard();
+    }
+}
+unsafe fn result_action(s: &mut State, hwnd: HWND, index: usize) {
+    unsafe {
+        match index {
+            0 => open(s, false),
+            1 => open(s, true),
+            _ => copy_path(s, hwnd),
+        };
+        InvalidateRect(hwnd, null(), 0);
+    }
+}
 unsafe fn sync_tips(s: &mut State) {
     unsafe {
         let unit = |n| n * s.dpi / 96;
         let mut tips = vec![
             Tip {
-                bounds: (unit(435), 0, unit(475), unit(40)),
+                bounds: (
+                    unit(if s.dashboard.is_some() { 595 } else { 435 }),
+                    0,
+                    unit(if s.dashboard.is_some() { 635 } else { 475 }),
+                    unit(40),
+                ),
                 text: "刷新".into(),
             },
             Tip {
-                bounds: (unit(475), 0, unit(520), unit(40)),
+                bounds: (
+                    unit(if s.dashboard.is_some() { 635 } else { 475 }),
+                    0,
+                    unit(if s.dashboard.is_some() { 680 } else { 520 }),
+                    unit(40),
+                ),
                 text: "收起".into(),
             },
         ];
@@ -289,7 +430,7 @@ unsafe fn sync_tips(s: &mut State) {
                 bounds: (
                     unit(12),
                     unit(top + i as i32 * 62),
-                    unit(508),
+                    unit(390),
                     unit(top + i as i32 * 62 + 58),
                 ),
                 text: row
@@ -297,6 +438,26 @@ unsafe fn sync_tips(s: &mut State) {
                     .clone()
                     .unwrap_or_else(|| format!("{}\n{}", row.title, row.detail)),
             });
+            if row.path.is_some() {
+                for (n, title) in [
+                    "打开 · Enter",
+                    "打开所在位置 · Ctrl+Enter",
+                    "复制完整路径 · Ctrl+Shift+C",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    tips.push(Tip {
+                        bounds: (
+                            unit(394 + n as i32 * 36),
+                            unit(top + i as i32 * 62),
+                            unit(430 + n as i32 * 36),
+                            unit(top + i as i32 * 62 + 58),
+                        ),
+                        text: (*title).into(),
+                    });
+                }
+            }
         }
         if let Some(tooltips) = s.tips.as_mut() {
             tooltips.sync(tips);
@@ -319,6 +480,89 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
         let s = &mut *p;
         let unit = |n| n * s.dpi / 96;
         match msg {
+            m if m == WM_APP + 19 => {
+                let operation = Box::from_raw(l as *mut ultra_bar_plugin_sdk::editors::Operation);
+                let _ = ultra_bar_native_ui::editor_bridge::request(
+                    s.host,
+                    hwnd,
+                    &s.plugin_id,
+                    *operation,
+                );
+                0
+            }
+            m if m == WM_APP + 18 => {
+                let data = Box::from_raw(l as *mut (usize, String));
+                s.host = data.0 as HWND;
+                s.plugin_id = data.1.clone();
+                if s.search {
+                    let field = ultra_bar_plugin_sdk::editors::Field::new(
+                        "query",
+                        "",
+                        ultra_bar_plugin_sdk::editors::Kind::Search,
+                        "",
+                    );
+                    let _ = ultra_bar_native_ui::editor_bridge::request(
+                        s.host,
+                        hwnd,
+                        &s.plugin_id,
+                        ultra_bar_plugin_sdk::editors::Operation::Mount {
+                            session: 1,
+                            field,
+                            x: unit(22),
+                            y: unit(48),
+                            width: unit(476),
+                            height: unit(30),
+                        },
+                    );
+                }
+                0
+            }
+            WM_COPYDATA if l != 0 && w as HWND == s.host => {
+                let packet =
+                    &*(l as *const windows_sys::Win32::System::DataExchange::COPYDATASTRUCT);
+                if packet.dwData == ultra_bar_plugin_sdk::editors::EVENT
+                    && packet.cbData <= 65536
+                    && !packet.lpData.is_null()
+                {
+                    let bytes = std::slice::from_raw_parts(
+                        packet.lpData as *const u8,
+                        packet.cbData as usize,
+                    );
+                    if let Ok(event) =
+                        serde_json::from_slice::<ultra_bar_plugin_sdk::editors::EditorEvent>(bytes)
+                    {
+                        if s.search && event.session == 1 {
+                            if event.action == "opened" {
+                                s.edit = event.input as HWND;
+                                if IsWindowVisible(hwnd) != 0 {
+                                    SetFocus(s.edit);
+                                }
+                            }
+                            if event.action == "closed" {
+                                s.edit = null_mut();
+                            }
+                            if event.action == "change"
+                                && let Some(query) = event.values.get("query")
+                            {
+                                let _ = s.input.try_send(Command::Query(query.clone()));
+                            }
+                            return 1;
+                        }
+                        return i32::from(s.input.try_send(Command::Editor(event)).is_ok())
+                            as isize;
+                    }
+                }
+                0
+            }
+            m if m == WM_APP + 7 => {
+                let _ = ultra_bar_native_ui::editor_bridge::request(
+                    s.host,
+                    hwnd,
+                    &s.plugin_id,
+                    ultra_bar_plugin_sdk::editors::Operation::Settings,
+                );
+                0
+            }
             WM_NCHITTEST => {
                 let y = ((l as u32 >> 16) as i16) as i32;
                 let mut pt = POINT {
@@ -326,13 +570,48 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                     y,
                 };
                 ScreenToClient(hwnd, &mut pt);
-                if pt.y < unit(40) && pt.x < unit(395) {
+                if s.dashboard
+                    .as_ref()
+                    .map(|view| view.draggable(pt.x * 96 / s.dpi, pt.y * 96 / s.dpi))
+                    .unwrap_or(pt.y < unit(40) && pt.x < unit(395))
+                {
                     HTCAPTION as _
                 } else {
                     HTCLIENT as _
                 }
             }
             WM_APP => 0,
+            m if m == WM_APP + 6 => {
+                if s.dashboard.is_none() {
+                    let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style & !(WS_EX_LAYERED as isize));
+                    SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED as isize);
+                }
+                while let Ok(data) = s.statistics_rx.try_recv() {
+                    s.dashboard
+                        .get_or_insert_with(Default::default)
+                        .replace(data);
+                }
+                let mut work: RECT = zeroed();
+                SystemParametersInfoW(SPI_GETWORKAREA, 0, (&mut work as *mut RECT).cast(), 0);
+                let height = unit(620).min(work.bottom - work.top - unit(20));
+                SetWindowPos(
+                    hwnd,
+                    null_mut(),
+                    0,
+                    0,
+                    unit(680),
+                    height,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                SetWindowRgn(
+                    hwnd,
+                    CreateRoundRectRgn(0, 0, unit(680), height, unit(18), unit(18)),
+                    1,
+                );
+                InvalidateRect(hwnd, null(), 0);
+                0
+            }
             m if m == WM_APP + 5 => {
                 while let Ok(fields) = s.settings_rx.try_recv() {
                     s.settings = fields;
@@ -343,12 +622,13 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
             }
             m if m == WM_APP + 1 => {
                 while let Ok((rows, status)) = s.receive.try_recv() {
+                    s.context = None;
                     s.rows = rows;
                     s.status = status;
                     s.selected = s.selected.min(s.rows.len().saturating_sub(1));
                     s.scroll = s.scroll.min(s.selected);
                 }
-                if !s.search {
+                if !s.search && s.dashboard.is_none() {
                     let height = unit(110 + s.rows.len().clamp(1, 5) as i32 * 62);
                     SetWindowPos(
                         hwnd,
@@ -370,6 +650,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                 0
             }
             m if m == WM_APP + 2 => {
+                if !s.popover.toggle(hwnd) {
+                    return 0;
+                }
                 if std::env::var_os("ULTRA_BAR_PLUGIN_CAPTURE_DIR").is_some() {
                     SetWindowPos(
                         hwnd,
@@ -392,7 +675,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                     if s.search {
                         area.left + unit(10)
                     } else {
-                        area.right - unit(530)
+                        area.right - (bounds.right - bounds.left) - unit(10)
                     },
                     area.bottom - (bounds.bottom - bounds.top) - unit(10),
                     0,
@@ -403,6 +686,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                 if s.search {
                     SetFocus(s.edit);
                 }
+                let _ = s.input.try_send(Command::Host(HostEvent::Show));
+                0
+            }
+            WM_ACTIVATE if w & 0xffff == WA_INACTIVE as usize => {
+                s.context = None;
+                s.popover.outside(hwnd);
                 0
             }
             m if m == WM_APP + 3 => {
@@ -433,7 +722,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
             WM_KEYDOWN => {
                 match w as u16 {
                     VK_ESCAPE => {
-                        ShowWindow(hwnd, SW_HIDE);
+                        if s.context.take().is_none() {
+                            ShowWindow(hwnd, SW_HIDE);
+                        }
                     }
                     VK_RETURN => open(s, GetKeyState(VK_CONTROL as i32) < 0),
                     VK_DOWN => {
@@ -446,6 +737,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                         s.selected = s.selected.saturating_sub(1);
                         s.scroll = s.scroll.min(s.selected);
                     }
+                    key if key == b'C' as u16
+                        && GetKeyState(VK_CONTROL as i32) < 0
+                        && GetKeyState(VK_SHIFT as i32) < 0 =>
+                    {
+                        copy_path(s, hwnd)
+                    }
                     _ => {}
                 }
                 InvalidateRect(hwnd, null(), 0);
@@ -453,6 +750,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
             }
             WM_MOUSEWHEEL => {
                 let delta = (w >> 16) as i16;
+                if let Some(view) = s.dashboard.as_mut() {
+                    view.wheel(delta < 0);
+                    InvalidateRect(hwnd, null(), 0);
+                    return 0;
+                }
                 if delta < 0 {
                     s.scroll = (s.scroll + 1).min(s.rows.len().saturating_sub(5));
                 } else {
@@ -465,27 +767,56 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
             WM_LBUTTONUP | WM_LBUTTONDBLCLK => {
                 let x = l as i16 as i32 * 96 / s.dpi;
                 let y = (l >> 16) as i16 as i32 * 96 / s.dpi;
-                if y < 40 && x > 475 {
-                    ShowWindow(hwnd, SW_HIDE);
-                } else if y < 40 && x > 435 {
-                    let _ = s.input.try_send(Command::Refresh);
-                } else if y < 40 && x > 395 && !s.settings.is_empty() {
-                    if let Some(values) =
-                        ultra_bar_native_ui::form::edit(hwnd, "搜索设置", s.settings.clone())
-                    {
-                        let _ = s.input.try_send(Command::SettingsSaved(values));
+                if let Some((left, top)) = s.context.take() {
+                    if x >= left && x < left + 190 && y >= top && y < top + 120 {
+                        result_action(s, hwnd, ((y - top) / 40) as usize);
                     }
+                    InvalidateRect(hwnd, null(), 0);
+                    return 0;
+                }
+                let width = if s.dashboard.is_some() { 680 } else { 520 };
+                let header = if s.dashboard.is_some() { 54 } else { 40 };
+                if y < header && x > width - 45 {
+                    ShowWindow(hwnd, SW_HIDE);
+                } else if y < header && x > width - 85 {
+                    let _ = s.input.try_send(Command::Refresh);
+                } else if let Some(view) = s.dashboard.as_mut() {
+                    if view.click(x, y) {
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                } else if y < 40 && x > 395 && !s.settings.is_empty() {
+                    let _ = ultra_bar_native_ui::editor_bridge::request(
+                        s.host,
+                        hwnd,
+                        &s.plugin_id,
+                        ultra_bar_plugin_sdk::editors::Operation::Settings,
+                    );
                 } else {
                     let top = if s.search { 94 } else { 54 };
                     if y >= top && y < top + 310 {
                         s.selected = (s.scroll + ((y - top) / 62) as usize)
                             .min(s.rows.len().saturating_sub(1));
-                        if msg == WM_LBUTTONDBLCLK || x > 465 {
-                            open(s, x > 465);
+                        if (394..502).contains(&x) {
+                            result_action(s, hwnd, ((x - 394) / 36) as usize);
+                        } else if msg == WM_LBUTTONDBLCLK {
+                            open(s, false);
                         }
                         InvalidateRect(hwnd, null(), 0);
                     }
                 }
+                0
+            }
+            WM_RBUTTONUP if s.search => {
+                let x = l as i16 as i32 * 96 / s.dpi;
+                let y = (l >> 16) as i16 as i32 * 96 / s.dpi;
+                if (94..404).contains(&y) {
+                    let selected = s.scroll + ((y - 94) / 62) as usize;
+                    if s.rows.get(selected).is_some_and(|r| r.path.is_some()) {
+                        s.selected = selected;
+                        s.context = Some((x.clamp(12, 318), y.clamp(94, 292)));
+                    }
+                }
+                InvalidateRect(hwnd, null(), 0);
                 0
             }
             WM_CTLCOLOREDIT => {
@@ -499,6 +830,19 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                 BeginPaint(hwnd, &mut ps);
                 let mut area: RECT = zeroed();
                 GetClientRect(hwnd, &mut area);
+                if let Some(view) = s.dashboard.as_mut() {
+                    if let Some(surface) = Surface::new(area.right, area.bottom) {
+                        view.paint(&surface, s.font, s.icons, s.dpi, &area);
+                        surface.present(hwnd, true);
+                        if let Some(dir) = std::env::var_os("ULTRA_BAR_PLUGIN_CAPTURE_DIR") {
+                            let _ = surface.save_bmp(
+                                &std::path::PathBuf::from(dir).join("agent-statistics.bmp"),
+                            );
+                        }
+                    }
+                    EndPaint(hwnd, &ps);
+                    return 0;
+                }
                 if let Some(surface) = Surface::new(area.right, area.bottom) {
                     let dc = surface.dc;
                     let palette = theme::palette();
@@ -560,11 +904,15 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                             SelectObject(dc, pen);
                             DeleteObject(brush);
                         }
-                        text(&row.title, 22, y + 3, 440, 26, palette.text);
-                        text(&row.detail, 22, y + 29, 440, 23, palette.muted);
+                        text(&row.title, 22, y + 3, 360, 26, palette.text);
+                        text(&row.detail, 22, y + 29, 360, 23, palette.muted);
                         if row.path.is_some() {
                             SelectObject(dc, s.icons);
-                            text("\u{e838}", 478, y + 12, 24, 28, palette.muted);
+                            for (n, glyph) in
+                                ["\u{e8a7}", "\u{e8b7}", "\u{e8c8}"].iter().enumerate()
+                            {
+                                text(glyph, 400 + n as i32 * 36, y + 12, 24, 28, palette.muted);
+                            }
                             SelectObject(dc, s.font);
                         }
                     }
@@ -576,21 +924,30 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                         28,
                         palette.muted,
                     );
+                    if let Some((x, y)) = s.context {
+                        let b = SelectObject(dc, theme::field_brush());
+                        let pen = SelectObject(dc, GetStockObject(NULL_PEN));
+                        RoundRect(
+                            dc,
+                            unit(x),
+                            unit(y),
+                            unit(x + 190),
+                            unit(y + 120),
+                            unit(12),
+                            unit(12),
+                        );
+                        SelectObject(dc, b);
+                        SelectObject(dc, pen);
+                        for (i, label) in
+                            ["打开", "打开所在位置", "复制完整路径"].iter().enumerate()
+                        {
+                            text(label, x + 16, y + i as i32 * 40, 164, 40, palette.text);
+                        }
+                    }
                     // Constant alpha keeps native EDIT/caret rendering; per-pixel layered updates
                     // would omit child controls from the composed panel.
-                    BitBlt(ps.hdc, 0, 0, area.right, area.bottom, dc, 0, 0, SRCCOPY);
+                    surface.blit_opaque(ps.hdc);
                     if let Some(directory) = std::env::var_os("ULTRA_BAR_PLUGIN_CAPTURE_DIR") {
-                        if !s.edit.is_null() {
-                            let saved = SaveDC(dc);
-                            SetViewportOrgEx(dc, unit(22), unit(48), null_mut());
-                            SendMessageW(
-                                s.edit,
-                                WM_PRINTCLIENT,
-                                dc as usize,
-                                (PRF_CLIENT | PRF_ERASEBKGND) as isize,
-                            );
-                            RestoreDC(dc, saved);
-                        }
                         let name = if s.search {
                             "everything-panel.bmp"
                         } else {

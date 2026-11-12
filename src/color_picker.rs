@@ -167,6 +167,7 @@ unsafe fn create(owner: HWND, initial: u32) -> Option<Box<Picker>> {
             null(),
         );
         SendMessageW(state.edit, WM_SETFONT, state.font as usize, 1);
+        ultra_bar_native_ui::input::attach(state.edit);
         SendMessageW(state.edit, EM_SETLIMITTEXT, 7, 0);
         let margin = state.unit(8) as u32;
         SendMessageW(
@@ -525,7 +526,7 @@ unsafe fn paint(state: &mut Picker) {
             );
             let _ = surface.save_bmp(&path);
         }
-        BitBlt(ps.hdc, 0, 0, area.right, area.bottom, dc, 0, 0, SRCCOPY);
+        surface.blit_opaque(ps.hdc);
         SelectObject(dc, old);
         EndPaint(state.hwnd, &ps);
     }

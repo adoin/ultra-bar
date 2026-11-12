@@ -15,6 +15,7 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location -LiteralPath $root
 $env:CARGO_BUILD_JOBS = "$Jobs"
 $env:CARGO_TARGET_DIR = Join-Path $root 'target/dev-build'
+$env:ULTRA_BAR_LOG_DIR = Join-Path $root 'target/logs'
 $stateDir = Join-Path $root 'target/dev-watch'
 $runDir = Join-Path $root 'target/dev-run'
 New-Item -ItemType Directory -Force $stateDir, $runDir | Out-Null
@@ -30,11 +31,14 @@ $exitCode = 0
 
 function Stop-App {
     if ($script:app -and -not $script:app.HasExited) {
-        $null = $script:app.CloseMainWindow()
-        # The recovery watchdog must survive its parent; never kill the app's tree.
-        if (-not $script:app.WaitForExit(2000)) { $script:app.Kill(); $script:app.WaitForExit() }
+        & $script:app.StartInfo.FileName --request-exit | Out-Host
+        if ($LASTEXITCODE -ne 0 -or -not $script:app.WaitForExit(2000)) {
+            Write-Warning '[dev] Keeping the current app and unsaved windows; close the editor before retrying reload.'
+            return $false
+        }
     }
     if ($script:app) { $script:app.Dispose(); $script:app = $null }
+    return $true
 }
 
 function Build-App {
@@ -45,7 +49,7 @@ function Build-App {
     if ($LASTEXITCODE -ne 0) { Write-Warning '[dev] build failed; existing application remains running'; return $false }
     if ($Task -ne 'TrayDiagnose' -and -not (Build-Plugins $operation)) { return $false }
     if ($Task -ne 'Run') { return $true }
-    Stop-App
+    if (-not (Stop-App)) { return $false }
     Close-Logs
     # Recovery helpers can retain the previous image after the UI has exited.
     # Keep immutable development copies rather than overwriting their executable.
@@ -159,7 +163,7 @@ try {
             }
             if ($app -and $app.HasExited) {
                 Write-Warning "[dev] app exited ($($app.ExitCode)); save a Rust file to restart"
-                Stop-App; Close-Logs
+                $null = Stop-App; Close-Logs
             }
         }
     }
@@ -167,7 +171,8 @@ try {
 finally {
     foreach ($subscription in $subscriptions) { Unregister-Event -SubscriptionId $subscription.SubscriptionId }
     foreach ($watcher in $watchers) { $watcher.Dispose() }
-    Stop-App; Close-Logs
+    while (-not (Stop-App)) { Start-Sleep -Seconds 2 }
+    Close-Logs
     if ($ownsMutex) { $mutex.ReleaseMutex() }
     $mutex.Dispose()
 }

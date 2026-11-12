@@ -121,6 +121,11 @@ pub fn install_at(
     source: Option<Source>,
     expected: Option<&CatalogEntry>,
 ) -> Result<InstallResult> {
+    ultra_bar_native_ui::diagnostics::event(
+        "plugins",
+        "package.install_requested",
+        serde_json::json!({"package":path,"force":force}),
+    );
     let _lock = lock()?;
     ensure!(
         path.extension()
@@ -461,7 +466,7 @@ mod tests {
             name: "Clock".into(),
             version: version.into(),
             platform: PLATFORM.into(),
-            host: ">=0.1.0,<1.0.0".into(),
+            host: ">=1.0.0,<2.0.0".into(),
             build: None,
             files: vec![
                 FileDigest {

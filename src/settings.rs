@@ -44,12 +44,39 @@ impl TaskbarSize {
     }
 }
 
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveStyle {
+    Inset,
+    #[default]
+    #[serde(alias = "accent_inset", alias = "solid")]
+    Underline,
+    TopDot,
+}
+impl ActiveStyle {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Inset => "纯凹陷",
+            Self::Underline => "底部横条",
+            Self::TopDot => "顶部黑点",
+        }
+    }
+    pub fn next(self) -> Self {
+        match self {
+            Self::Inset => Self::Underline,
+            Self::Underline => Self::TopDot,
+            Self::TopDot => Self::Inset,
+        }
+    }
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub accent_color: String,
     pub icons_only: bool,
     pub size: TaskbarSize,
+    pub active_style: ActiveStyle,
     pub clock_format: String,
     pub clock_extension: String,
 }
@@ -59,6 +86,7 @@ impl Default for Settings {
             accent_color: crate::visual::theme::hex(crate::visual::theme::DEFAULT_ACCENT),
             icons_only: false,
             size: TaskbarSize::Normal,
+            active_style: ActiveStyle::default(),
             clock_format: crate::clock::DEFAULT_FORMAT.into(),
             clock_extension: String::new(),
         }
@@ -87,12 +115,37 @@ impl Settings {
         std::fs::create_dir_all(path.parent().context("invalid settings path")?)?;
         let pending = path.with_extension("json.new");
         std::fs::write(&pending, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(pending, path).context("Cannot save taskbar settings")
+        let previous = std::fs::read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok());
+        std::fs::rename(pending, &path).context("Cannot save taskbar settings")?;
+        ultra_bar_native_ui::diagnostics::event(
+            "settings",
+            "taskbar.saved",
+            serde_json::json!({"before":previous,"after":self,"path":path}),
+        );
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn older_active_styles_migrate_to_the_inset_marker_without_losing_preferences() {
+        for name in ["accent_inset", "solid"] {
+            let settings: super::Settings = serde_json::from_value(
+                serde_json::json!({"active_style":name,"icons_only":true,"accent_color":"#B8591A"}),
+            )
+            .unwrap();
+            assert_eq!(settings.active_style, super::ActiveStyle::Underline);
+            assert!(settings.icons_only);
+            assert_eq!(settings.accent_color, "#B8591A");
+        }
+        assert_eq!(
+            super::Settings::default().active_style,
+            super::ActiveStyle::Underline
+        );
+    }
     use super::*;
     #[test]
     fn external_gap_is_two_pixels_without_consuming_content_padding() {

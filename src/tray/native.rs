@@ -5,12 +5,13 @@ use std::{
     mem::{size_of, zeroed},
     path::Path,
     ptr::{null, null_mut},
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
 };
 use windows_sys::Win32::{
     Foundation::*,
-    System::{Diagnostics::Debug::*, Memory::*, Threading::*},
-    UI::{Controls::*, WindowsAndMessaging::*},
+    Graphics::Gdi::ScreenToClient,
+    System::{Diagnostics::Debug::*, Memory::*, SystemInformation::GetTickCount64, Threading::*},
+    UI::{Controls::*, Shell::*, WindowsAndMessaging::*},
 };
 use windows_sys::core::BOOL;
 
@@ -21,6 +22,7 @@ static MAIN_ROOT: AtomicUsize = AtomicUsize::new(0);
 static OVERFLOW_ROOT: AtomicUsize = AtomicUsize::new(0);
 pub static SKIPPED: AtomicUsize = AtomicUsize::new(0);
 static BLOCKED_PID: AtomicUsize = AtomicUsize::new(0);
+static BLOCKED_AT: AtomicU64 = AtomicU64::new(0);
 
 pub fn event(hwnd: HWND, event: u32) {
     let hwnd = hwnd as usize;
@@ -183,8 +185,24 @@ impl Remote {
         unsafe {
             let mut pid = 0;
             GetWindowThreadProcessId(toolbar, &mut pid);
+            if pid == 0 {
+                bail!("托盘宿主已退出");
+            }
             if BLOCKED_PID.load(Ordering::Relaxed) == pid as usize {
-                bail!("Explorer 托盘查询曾超时，已暂停桥接");
+                let now = GetTickCount64();
+                if now.saturating_sub(BLOCKED_AT.load(Ordering::Relaxed)) < 5000 {
+                    bail!("Explorer 托盘查询超时，稍后重试");
+                }
+                BLOCKED_AT.store(now, Ordering::Relaxed);
+                // Probe without a remote-memory pointer. The timed-out allocation
+                // stays quarantined by Remote::drop; retries use a fresh buffer.
+                message(toolbar as _, WM_NULL, 0, 0)?;
+                ultra_bar_native_ui::diagnostics::event(
+                    "tray",
+                    "bridge.resumed",
+                    serde_json::json!({"explorer_pid":pid,"toolbar":toolbar as usize,"backoff_ms":5000}),
+                );
+                BLOCKED_PID.store(0, Ordering::Relaxed);
             }
             let process = OpenProcess(
                 PROCESS_VM_READ
@@ -244,6 +262,7 @@ impl Remote {
         if result.is_err() {
             self.uncertain.set(true);
             BLOCKED_PID.store(self.pid as usize, Ordering::Relaxed);
+            BLOCKED_AT.store(unsafe { GetTickCount64() }, Ordering::Relaxed);
         }
         result
     }
@@ -339,6 +358,7 @@ impl Remote {
 
 unsafe fn message(hwnd: HWND, msg: u32, w: usize, l: isize) -> Result<usize> {
     unsafe {
+        let started = GetTickCount64();
         let mut result = 0;
         if SendMessageTimeoutW(
             hwnd,
@@ -350,10 +370,13 @@ unsafe fn message(hwnd: HWND, msg: u32, w: usize, l: isize) -> Result<usize> {
             &mut result,
         ) == 0
         {
-            bail!(
-                "Explorer 托盘查询失败（错误 {}，消息 {msg}）",
-                GetLastError()
+            let error = GetLastError();
+            ultra_bar_native_ui::diagnostics::event(
+                "tray",
+                "query.failed",
+                serde_json::json!({"hwnd":hwnd as usize,"message_id":msg,"win32_error":error,"elapsed_ms":GetTickCount64()-started}),
             );
+            bail!("Explorer 托盘查询失败（错误 {}，消息 {msg}）", error);
         }
         Ok(result)
     }
@@ -503,6 +526,237 @@ pub enum Click {
     Left,
     Right,
     Double,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HoverEvent {
+    Move,
+    Open,
+    Close,
+}
+pub struct HoverTarget {
+    data: TrayData,
+    pid: u32,
+    toolbar: HWND,
+}
+impl HoverTarget {
+    pub fn new(endpoint: &Endpoint) -> Result<Self> {
+        unsafe {
+            let remote = Remote::open(endpoint.toolbar as _)?;
+            let index = message(
+                endpoint.toolbar as _,
+                TB_COMMANDTOINDEX,
+                endpoint.command as usize,
+                0,
+            )?;
+            if index > 1024 {
+                bail!("托盘图标已移除");
+            }
+            let (_, data) = remote.button(endpoint.toolbar as _, index)?;
+            let mut pid = 0;
+            GetWindowThreadProcessId(data.owner as _, &mut pid);
+            if data.owner != endpoint.owner
+                || data.id != endpoint.id
+                || pid != endpoint.pid
+                || data.callback == 0
+            {
+                bail!("托盘图标已变更");
+            }
+            Ok(Self {
+                data,
+                pid,
+                toolbar: endpoint.toolbar as _,
+            })
+        }
+    }
+    pub fn relay(&self, event: HoverEvent, point: (i32, i32)) -> Result<()> {
+        unsafe {
+            let mut pid = 0;
+            let thread = GetWindowThreadProcessId(self.data.owner as _, &mut pid);
+            if pid == 0 || pid != self.pid {
+                bail!("托盘程序已经退出");
+            }
+            if event != HoverEvent::Close {
+                let foreground = GetForegroundWindow();
+                let mut foreground_pid = 0;
+                let foreground_thread = GetWindowThreadProcessId(foreground, &mut foreground_pid);
+                let mut info: GUITHREADINFO = zeroed();
+                info.cbSize = size_of::<GUITHREADINFO>() as u32;
+                let available = GetGUIThreadInfo(foreground_thread, &mut info) != 0;
+                let mut class = [0u16; 128];
+                let n = GetClassNameW(info.hwndFocus, class.as_mut_ptr(), 128);
+                eprintln!(
+                    "[tray-hover-context] event={event:?} pid={pid} foreground={:#x} foreground_pid={foreground_pid} gui={available} focus={:#x} focus_class={} capture={:#x} flags={:x}",
+                    foreground as usize,
+                    info.hwndFocus as usize,
+                    String::from_utf16_lossy(&class[..n.max(0) as usize]),
+                    info.hwndCapture as usize,
+                    info.flags
+                );
+            }
+            if event != HoverEvent::Close {
+                align_hover_anchor(self.toolbar, &self.data, point);
+            }
+            let transfer_to_preview = event == HoverEvent::Close
+                && super::hover_popup::visible(self.data.owner, pid, self.data.id);
+            super::hover_popup::source(self.data.owner, pid, self.data.id, thread, point, event);
+            if transfer_to_preview {
+                return Ok(());
+            }
+            let event = match event {
+                HoverEvent::Move => WM_MOUSEMOVE,
+                HoverEvent::Open if self.data.version == 4 => 0x400 + 6,
+                HoverEvent::Close if self.data.version == 4 => 0x400 + 7,
+                _ => return Ok(()),
+            };
+            // Explorer can finish laying out the transparent toolbar after the
+            // entry notification. Qt-based v4 clients open previews on MOUSEMOVE,
+            // rather than NIN_POPUPOPEN, so repeat it once at the hover deadline
+            // after refreshing the native anchor. Legacy clients must not receive
+            // this repeat: some rebuild their preview for every mouse move.
+            if event == 0x400 + 6
+                && !super::hover_popup::visible(self.data.owner, pid, self.data.id)
+            {
+                let (w, l) = notification_packet(
+                    self.data.id,
+                    self.data.version,
+                    WM_MOUSEMOVE,
+                    POINT {
+                        x: point.0,
+                        y: point.1,
+                    },
+                );
+                if PostMessageW(self.data.owner as _, self.data.callback, w, l) == 0 {
+                    bail!("无法重发托盘悬停通知");
+                }
+            }
+            let (w, l) = notification_packet(
+                self.data.id,
+                self.data.version,
+                event,
+                POINT {
+                    x: point.0,
+                    y: point.1,
+                },
+            );
+            if PostMessageW(self.data.owner as _, self.data.callback, w, l) == 0 {
+                bail!("无法发送托盘悬停通知");
+            }
+            Ok(())
+        }
+    }
+}
+const ANCHOR_X: &str = "UltraBar.TrayAnchor.X.v1";
+const ANCHOR_Y: &str = "UltraBar.TrayAnchor.Y.v1";
+unsafe fn restore_hover_anchor(hwnd: HWND) {
+    unsafe {
+        let x = GetPropW(hwnd, wide(ANCHOR_X).as_ptr()) as usize;
+        let y = GetPropW(hwnd, wide(ANCHOR_Y).as_ptr()) as usize;
+        if x != 0 && y != 0 {
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                (x as i64 - 0x80000001) as i32,
+                (y as i64 - 0x80000001) as i32,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+        }
+        RemovePropW(hwnd, wide(ANCHOR_X).as_ptr());
+        RemovePropW(hwnd, wide(ANCHOR_Y).as_ptr());
+    }
+}
+pub unsafe fn restore_hover_positions(root: HWND) {
+    unsafe extern "system" fn restore(hwnd: HWND, _: LPARAM) -> BOOL {
+        unsafe {
+            restore_hover_anchor(hwnd);
+        }
+        1
+    }
+    unsafe {
+        EnumChildWindows(root, Some(restore), 0);
+    }
+}
+impl Drop for HoverTarget {
+    fn drop(&mut self) {
+        unsafe {
+            restore_hover_anchor(self.toolbar);
+        }
+    }
+}
+unsafe fn align_hover_anchor(toolbar: HWND, data: &TrayData, point: (i32, i32)) {
+    unsafe {
+        let root = GetAncestor(toolbar, GA_ROOT);
+        // Only touch the invisible Explorer toolbar managed by our takeover guard.
+        if GetPropW(
+            root,
+            wide("UltraBar.NativeTaskbar.OriginalExStyle.v1").as_ptr(),
+        )
+        .is_null()
+        {
+            return;
+        }
+        let identity = NOTIFYICONIDENTIFIER {
+            cbSize: size_of::<NOTIFYICONIDENTIFIER>() as u32,
+            hWnd: data.owner as _,
+            uID: data.id,
+            guidItem: zeroed(),
+        };
+        let mut icon: RECT = zeroed();
+        if Shell_NotifyIconGetRect(&identity, &mut icon) < 0 {
+            return;
+        }
+        let dx = point.0 - (icon.left + icon.right) / 2;
+        let dy = point.1 - (icon.top + icon.bottom) / 2;
+        if dx == 0 && dy == 0 {
+            return;
+        }
+        let mut rect: RECT = zeroed();
+        if GetWindowRect(toolbar, &mut rect) == 0 {
+            return;
+        }
+        let mut origin = POINT {
+            x: rect.left,
+            y: rect.top,
+        };
+        ScreenToClient(GetParent(toolbar), &mut origin);
+        if GetPropW(toolbar, wide(ANCHOR_X).as_ptr()).is_null() {
+            if SetPropW(
+                toolbar,
+                wide(ANCHOR_X).as_ptr(),
+                (origin.x as i64 + 0x80000001) as usize as _,
+            ) == 0
+            {
+                return;
+            }
+            if SetPropW(
+                toolbar,
+                wide(ANCHOR_Y).as_ptr(),
+                (origin.y as i64 + 0x80000001) as usize as _,
+            ) == 0
+            {
+                RemovePropW(toolbar, wide(ANCHOR_X).as_ptr());
+                return;
+            }
+        }
+        SetWindowPos(
+            toolbar,
+            null_mut(),
+            origin.x + dx,
+            origin.y + dy,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+        let result = Shell_NotifyIconGetRect(&identity, &mut icon);
+        if result < 0 {
+            restore_hover_anchor(toolbar);
+        }
+        eprintln!(
+            "[tray-anchor] id={} hr={result:x} cursor={point:?} rect={},{},{},{}",
+            data.id, icon.left, icon.top, icon.right, icon.bottom
+        );
+    }
 }
 fn notification_packet(id: u32, version: u32, event: u32, point: POINT) -> (usize, isize) {
     if version == 4 {
@@ -669,6 +923,155 @@ pub fn relay(endpoint: &Endpoint, click: Click) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_restores_saved_toolbar_position_and_removes_properties() {
+        unsafe {
+            let hwnd = CreateWindowExW(
+                WS_EX_TOOLWINDOW,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_POPUP,
+                -120,
+                80,
+                100,
+                30,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null(),
+            );
+            assert!(!hwnd.is_null());
+            let mut original: RECT = zeroed();
+            GetWindowRect(hwnd, &mut original);
+            assert_ne!(
+                SetPropW(
+                    hwnd,
+                    wide(ANCHOR_X).as_ptr(),
+                    (original.left as i64 + 0x80000001) as usize as _
+                ),
+                0
+            );
+            assert_ne!(
+                SetPropW(
+                    hwnd,
+                    wide(ANCHOR_Y).as_ptr(),
+                    (original.top as i64 + 0x80000001) as usize as _
+                ),
+                0
+            );
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                200,
+                300,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            restore_hover_anchor(hwnd);
+            restore_hover_anchor(hwnd);
+            let mut restored: RECT = zeroed();
+            GetWindowRect(hwnd, &mut restored);
+            assert_eq!((restored.left, restored.top), (original.left, original.top));
+            assert!(GetPropW(hwnd, wide(ANCHOR_X).as_ptr()).is_null());
+            assert!(GetPropW(hwnd, wide(ANCHOR_Y).as_ptr()).is_null());
+            DestroyWindow(hwnd);
+        }
+    }
+    unsafe extern "system" fn hover_probe(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRESULT {
+        unsafe {
+            if msg == WM_NCCREATE {
+                SetWindowLongPtrW(
+                    hwnd,
+                    GWLP_USERDATA,
+                    (*(l as *const CREATESTRUCTW)).lpCreateParams as isize,
+                );
+            }
+            if msg == WM_APP + 88 {
+                let received = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Vec<(usize, isize)>;
+                if !received.is_null() {
+                    (*received).push((w, l));
+                }
+                return 0;
+            }
+            DefWindowProcW(hwnd, msg, w, l)
+        }
+    }
+    #[test]
+    fn hover_callbacks_use_the_registered_protocol_without_sending_clicks() {
+        unsafe {
+            let _test = crate::tray::hover_popup::TEST_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let class = wide(&format!("UltraBar.TrayHoverProbe.{}", GetCurrentThreadId()));
+            let module = windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(null());
+            RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(hover_probe),
+                hInstance: module,
+                lpszClassName: class.as_ptr(),
+                ..zeroed()
+            });
+            let mut received: Vec<(usize, isize)> = vec![];
+            let hwnd = CreateWindowExW(
+                0,
+                class.as_ptr(),
+                null(),
+                0,
+                0,
+                0,
+                0,
+                0,
+                HWND_MESSAGE,
+                null_mut(),
+                module,
+                (&mut received as *mut Vec<(usize, isize)>).cast(),
+            );
+            assert!(!hwnd.is_null());
+            let mut target = HoverTarget {
+                data: TrayData {
+                    owner: hwnd as usize,
+                    id: 42,
+                    callback: WM_APP + 88,
+                    flags: 0,
+                    version: 4,
+                    icon: 0,
+                },
+                pid: GetCurrentProcessId(),
+                toolbar: null_mut(),
+            };
+            for event in [HoverEvent::Move, HoverEvent::Open, HoverEvent::Close] {
+                target.relay(event, (-120, 1080)).unwrap();
+            }
+            let mut message: MSG = zeroed();
+            while PeekMessageW(&mut message, hwnd, WM_APP + 88, WM_APP + 88, PM_REMOVE) != 0 {
+                DispatchMessageW(&message);
+            }
+            assert_eq!(received.len(), 4);
+            for ((w, l), event) in received
+                .iter()
+                .zip([WM_MOUSEMOVE, WM_MOUSEMOVE, 0x406, 0x407])
+            {
+                assert_eq!(*w as u16 as i16, -120);
+                assert_eq!((*w >> 16) as u16 as i16, 1080);
+                assert_eq!(*l as u16 as u32, event);
+                assert_eq!((*l >> 16) as u16, 42);
+            }
+            target.data.version = 0;
+            target.data.id = 0x12345678;
+            for event in [HoverEvent::Move, HoverEvent::Open, HoverEvent::Close] {
+                target.relay(event, (1, 2)).unwrap();
+            }
+            while PeekMessageW(&mut message, hwnd, WM_APP + 88, WM_APP + 88, PM_REMOVE) != 0 {
+                DispatchMessageW(&message);
+            }
+            assert_eq!(received.len(), 5);
+            assert_eq!(received[4], (0x12345678, WM_MOUSEMOVE as isize));
+            target.pid = GetCurrentProcessId().wrapping_add(1);
+            assert!(target.relay(HoverEvent::Move, (0, 0)).is_err());
+            DestroyWindow(hwnd);
+            UnregisterClassW(class.as_ptr(), module);
+        }
+    }
     #[test]
     fn modern_menu_notification_preserves_id_and_signed_screen_anchor() {
         let (w, l) = notification_packet(42, 4, WM_CONTEXTMENU, POINT { x: -120, y: 1080 });

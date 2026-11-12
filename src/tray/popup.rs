@@ -10,7 +10,12 @@ use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
     System::LibraryLoader::*,
-    UI::{HiDpi::GetSystemMetricsForDpi, Input::KeyboardAndMouse::*, WindowsAndMessaging::*},
+    UI::{
+        Controls::{WM_MOUSEHOVER, WM_MOUSELEAVE},
+        HiDpi::GetSystemMetricsForDpi,
+        Input::KeyboardAndMouse::*,
+        WindowsAndMessaging::*,
+    },
 };
 
 #[derive(Clone)]
@@ -25,6 +30,7 @@ struct Hit {
     label: String,
 }
 struct State {
+    hover: super::Hover,
     cancelled_click: bool,
     drag: Option<(String, POINT, bool)>,
     dropped: Option<(String, POINT)>,
@@ -98,6 +104,7 @@ impl Popup {
                 ..zeroed()
             });
             let mut state = Box::new(State {
+                hover: super::Hover::default(),
                 cancelled_click: false,
                 drag: None,
                 dropped: None,
@@ -150,6 +157,9 @@ impl Popup {
                 .iter()
                 .map(|i| self.state.snapshot.items[*i].key.clone())
                 .collect::<Vec<_>>();
+        if relayout {
+            self.state.hover.leave(&self.state.sender);
+        }
         unsafe {
             if IsWindowVisible(self.state.hwnd) != 0 {
                 if relayout {
@@ -288,6 +298,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_ERASEBKGND => 1,
+            WM_TIMER if w == super::HOVER_TIMER => {
+                KillTimer(hwnd, super::HOVER_TIMER);
+                let mut point: POINT = zeroed();
+                if GetCursorPos(&mut point) != 0 {
+                    ScreenToClient(hwnd, &mut point);
+                    if state.hits.iter().any(|hit| {
+                        point.x >= hit.rect.left
+                            && point.x < hit.rect.right
+                            && point.y >= hit.rect.top
+                            && point.y < hit.rect.bottom
+                            && matches!(&hit.action,Action::Icon(key)if state.hover.matches(key))
+                    }) {
+                        state.hover.open(&state.sender);
+                    }
+                }
+                0
+            }
             WM_TIMER if w == 11 => {
                 KillTimer(hwnd, 11);
                 ShowWindow(hwnd, SW_HIDE);
@@ -317,6 +344,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_LBUTTONDOWN => {
+                state.hover.leave(&state.sender);
                 state.cancelled_click = false;
                 KillTimer(hwnd, 11);
                 let point = POINT {
@@ -346,6 +374,36 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_MOUSEMOVE => {
+                let x = l as u16 as i16 as i32;
+                let y = (l >> 16) as u16 as i16 as i32;
+                let key = if state.drag.is_none() {
+                    state
+                        .hits
+                        .iter()
+                        .find(|hit| {
+                            x >= hit.rect.left
+                                && x < hit.rect.right
+                                && y >= hit.rect.top
+                                && y < hit.rect.bottom
+                        })
+                        .and_then(|hit| match &hit.action {
+                            Action::Icon(key) => Some(key.clone()),
+                            _ => None,
+                        })
+                } else {
+                    None
+                };
+                let anchor = state
+                    .hits
+                    .iter()
+                    .find(|hit| matches!(&hit.action, Action::Icon(k) if Some(k) == key.as_ref()));
+                let (ax, ay) = anchor.map_or((x, y), |hit| {
+                    (
+                        (hit.rect.left + hit.rect.right) / 2,
+                        (hit.rect.top + hit.rect.bottom) / 2,
+                    )
+                });
+                state.hover.motion(hwnd, key, ax, ay, &state.sender);
                 if let Some((_, start, active)) = &mut state.drag {
                     let x = l as u16 as i16 as i32;
                     let y = (l >> 16) as u16 as i16 as i32;
@@ -354,6 +412,22 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                         || (y - start.y).abs()
                             >= GetSystemMetricsForDpi(SM_CYDRAG, state.dpi as u32).max(4);
                 }
+                0
+            }
+            WM_MOUSEHOVER => {
+                state.hover.open(&state.sender);
+                0
+            }
+            WM_MOUSELEAVE => {
+                state.hover.leave(&state.sender);
+                0
+            }
+            WM_SHOWWINDOW if w == 0 => {
+                state.hover.leave(&state.sender);
+                0
+            }
+            WM_DESTROY => {
+                state.hover.leave(&state.sender);
                 0
             }
             WM_CAPTURECHANGED | WM_CANCELMODE => {
@@ -367,6 +441,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_LBUTTONUP | WM_RBUTTONUP | WM_LBUTTONDBLCLK => {
+                state.hover.leave(&state.sender);
                 if message == WM_LBUTTONUP && state.cancelled_click {
                     state.cancelled_click = false;
                     return 0;

@@ -12,7 +12,6 @@ use windows_sys::{
         Foundation::*,
         System::{Com::*, Registry::*, Threading::*},
         UI::{
-            Controls::Dialogs::*,
             Shell::{PropertiesSystem::SHGetPropertyStoreForWindow, *},
             WindowsAndMessaging::*,
         },
@@ -89,7 +88,13 @@ pub fn identity(executable: &str, window: usize) -> String {
 }
 pub fn task_identity(executable: &str, window: usize, hosted_id: Option<&str>) -> String {
     hosted_id
-        .map(|id| format!("hosted:{}:{id}", normalize(executable)))
+        .map(|id| {
+            if id.contains('!') {
+                format!("appx:{}", normalize(id))
+            } else {
+                format!("hosted:{}:{id}", normalize(executable))
+            }
+        })
         .unwrap_or_else(|| identity(executable, window))
 }
 pub fn hosted_app_id(hwnd: HWND, executable: &str) -> Option<String> {
@@ -97,7 +102,12 @@ pub fn hosted_app_id(hwnd: HWND, executable: &str) -> Option<String> {
         .file_name()?
         .to_str()?
         .to_ascii_lowercase();
-    if !(name == "godot.exe" || name.starts_with("godot_v") || name.starts_with("godot.windows.")) {
+    if !(name == "godot.exe"
+        || name.starts_with("godot_v")
+        || name.starts_with("godot.windows.")
+        || name == "applicationframehost.exe"
+        || normalize(executable).contains("\\windowsapps\\"))
+    {
         return None;
     }
     type Cache = std::collections::HashMap<(usize, u32), Option<Option<String>>>;
@@ -164,7 +174,7 @@ pub fn read_hosted_app_id(hwnd: HWND) -> Option<String> {
         ) < 0
             || pointer.is_null()
         {
-            return None;
+            return packaged_window_id(hwnd);
         }
         let properties = ComObject(pointer);
         let get: unsafe extern "system" fn(
@@ -186,13 +196,56 @@ pub fn read_hosted_app_id(hwnd: HWND) -> Option<String> {
             }
             let id = String::from_utf16_lossy(std::slice::from_raw_parts(text, len));
             // Official Godot builds publish separate IDs for games and the editor.
-            if id.starts_with("Godot.") && !id.starts_with("Godot.GodotEditor.") {
+            if (id.starts_with("Godot.") && !id.starts_with("Godot.GodotEditor."))
+                || id.contains('!')
+            {
                 result = Some(id);
             }
         }
         PropVariantClear(&mut value);
-        result
+        result.or_else(|| packaged_window_id(hwnd))
     }
+}
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn GetApplicationUserModelId(process: HANDLE, length: *mut u32, id: *mut u16) -> i32;
+}
+fn packaged_process_id(hwnd: HWND) -> Option<String> {
+    unsafe {
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut buffer = [0u16; 512];
+        let mut length = buffer.len() as u32;
+        let status = GetApplicationUserModelId(process, &mut length, buffer.as_mut_ptr());
+        CloseHandle(process);
+        if status != 0 || length < 2 || length as usize > buffer.len() {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buffer[..length as usize - 1]))
+    }
+}
+fn packaged_window_id(hwnd: HWND) -> Option<String> {
+    if let Some(id) = packaged_process_id(hwnd) {
+        return Some(id);
+    }
+    unsafe extern "system" fn child(hwnd: HWND, data: isize) -> i32 {
+        unsafe {
+            if let Some(id) = packaged_process_id(hwnd) {
+                *(data as *mut Option<String>) = Some(id);
+                return 0;
+            }
+            1
+        }
+    }
+    let mut id: Option<String> = None;
+    unsafe {
+        EnumChildWindows(hwnd, Some(child), (&mut id as *mut Option<String>) as isize);
+    }
+    id
 }
 pub fn process_path(hwnd: HWND) -> String {
     unsafe {
@@ -244,7 +297,7 @@ pub fn initial_pins() -> Vec<Shortcut> {
 }
 pub fn sync_system_pins() -> Result<serde_json::Value> {
     let previous = load();
-    let mut next = vec![];
+    let mut next = previous.clone();
     let mut skipped = vec![];
     for path in system_pins() {
         match from_file(&path).and_then(retain_link) {
@@ -259,8 +312,7 @@ pub fn sync_system_pins() -> Result<serde_json::Value> {
             Err(error) => skipped.push(format!("{}: {error:#}", path.display())),
         }
     }
-    let imported = next.len();
-    for pin in previous {
+    for pin in packaged_system_pins() {
         if !next
             .iter()
             .any(|old| normalize(&old.executable) == normalize(&pin.executable))
@@ -268,7 +320,8 @@ pub fn sync_system_pins() -> Result<serde_json::Value> {
             next.push(pin);
         }
     }
-    save(&next)?;
+    let imported = next.len().saturating_sub(previous.len());
+    save_with_reason(&next, "system_import")?;
     Ok(
         serde_json::json!({"imported":imported,"total":next.len(),"names":next.iter().map(|pin|pin.name.as_str()).collect::<Vec<_>>(),"skipped":skipped}),
     )
@@ -299,7 +352,14 @@ pub fn notify_pins_changed() {
         }
     }
 }
+#[track_caller]
 pub fn save(pins: &[Shortcut]) -> Result<()> {
+    save_with_reason(pins, "save")
+}
+#[track_caller]
+pub fn save_with_reason(pins: &[Shortcut], reason: &str) -> Result<()> {
+    let previous = load();
+    let caller = std::panic::Location::caller();
     let path = crate::data_paths::root()?.join("taskbar-apps.json");
     if path.exists() {
         let _: Vec<Shortcut> = serde_json::from_slice(&std::fs::read(&path)?)
@@ -309,6 +369,29 @@ pub fn save(pins: &[Shortcut]) -> Result<()> {
     let pending = path.with_extension("json.new");
     std::fs::write(&pending, serde_json::to_vec_pretty(pins)?)?;
     std::fs::rename(pending, path)?;
+    let removed: Vec<_> = previous
+        .iter()
+        .filter(|old| {
+            !pins
+                .iter()
+                .any(|new| normalize(&new.executable) == normalize(&old.executable))
+        })
+        .map(|p| serde_json::json!({"name":p.name,"executable":p.executable,"launch":p.launch}))
+        .collect();
+    let added: Vec<_> = pins
+        .iter()
+        .filter(|new| {
+            !previous
+                .iter()
+                .any(|old| normalize(&new.executable) == normalize(&old.executable))
+        })
+        .map(|p| serde_json::json!({"name":p.name,"executable":p.executable,"launch":p.launch}))
+        .collect();
+    ultra_bar_native_ui::diagnostics::event(
+        "tasks",
+        "pins.saved",
+        serde_json::json!({"reason":reason,"caller":{"file":caller.file(),"line":caller.line()},"before_count":previous.len(),"after_count":pins.len(),"removed":removed,"added":added,"before_order":previous.iter().map(|p|p.name.as_str()).collect::<Vec<_>>(),"after_order":pins.iter().map(|p|p.name.as_str()).collect::<Vec<_>>() }),
+    );
     Ok(())
 }
 pub fn retain_link(pin: Shortcut) -> Result<Shortcut> {
@@ -343,6 +426,7 @@ pub fn retain_link(pin: Shortcut) -> Result<Shortcut> {
 }
 pub fn from_file(path: &Path) -> Result<Shortcut> {
     let path = path.canonicalize()?;
+    ensure!(path.is_file(), "请拖入文件或快捷方式");
     let executable = match path
         .extension()
         .and_then(|s| s.to_str())
@@ -351,8 +435,11 @@ pub fn from_file(path: &Path) -> Result<Shortcut> {
         .as_str()
     {
         "exe" => path.to_string_lossy().into_owned(),
+        _ if crate::script_shortcuts::is_script(&path.to_string_lossy()) => {
+            path.to_string_lossy().into_owned()
+        }
         "lnk" => link_metadata(&path)?.0,
-        _ => anyhow::bail!("请选择 .exe 程序或 .lnk 快捷方式"),
+        _ => anyhow::bail!("请拖入 .exe、.lnk 或受支持的脚本文件"),
     };
     ensure!(!executable.is_empty(), "快捷方式没有可分组的程序目标");
     Ok(Shortcut {
@@ -444,7 +531,7 @@ unsafe fn link_app_id(link: &ComObject) -> Option<String> {
         result
     }
 }
-fn link_metadata(path: &Path) -> Result<(String, String, i32)> {
+fn link_metadata(path: &Path) -> Result<(String, String, i32, String, String)> {
     unsafe {
         let hr = CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
         let _apartment = Apartment(hr >= 0);
@@ -491,6 +578,11 @@ fn link_metadata(path: &Path) -> Result<(String, String, i32)> {
         let mut target = String::from_utf16_lossy(
             &buffer[..buffer.iter().position(|v| *v == 0).unwrap_or(buffer.len())],
         );
+        if target.is_empty()
+            && let Some(id) = link_app_id(&link).filter(|id| id.contains('!'))
+        {
+            target = format!("appx:{id}");
+        }
         if target.is_empty() && link_app_id(&link).as_deref() == Some("Microsoft.Windows.Explorer")
         {
             target = PathBuf::from(std::env::var_os("WINDIR").context("WINDIR 不可用")?)
@@ -541,15 +633,39 @@ fn link_metadata(path: &Path) -> Result<(String, String, i32)> {
         let source = String::from_utf16_lossy(
             &icon[..icon.iter().position(|v| *v == 0).unwrap_or(icon.len())],
         );
-        Ok((target, source, index))
+        let read = |slot| {
+            let get: unsafe extern "system" fn(*mut c_void, *mut u16, i32) -> i32 =
+                std::mem::transmute(link.method(slot));
+            let mut text = [0u16; 32768];
+            if get(link.0, text.as_mut_ptr(), text.len() as i32) < 0 {
+                return String::new();
+            }
+            if slot == 8 {
+                DoEnvironmentSubstW(text.as_mut_ptr(), text.len() as u32);
+            }
+            String::from_utf16_lossy(
+                &text[..text.iter().position(|c| *c == 0).unwrap_or(text.len())],
+            )
+        };
+        Ok((target, source, index, read(10), read(8)))
     }
 }
 pub unsafe fn icon(pin: &Shortcut, dpi: i32, size: i32) -> AppIcon {
     unsafe {
+        if pin.executable == crate::script_shortcuts::GROUP {
+            return AppIcon::from_file(
+                &crate::script_shortcuts::icon_path().to_string_lossy(),
+                dpi,
+                size,
+            );
+        }
+        if let Some(id) = pin.executable.strip_prefix("appx:") {
+            return AppIcon::from_file(&format!("shell:AppsFolder\\{id}"), dpi, size);
+        }
         if Path::new(&pin.launch)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
-            && let Ok((_, source, index)) = link_metadata(Path::new(&pin.launch))
+            && let Ok((_, source, index, _, _)) = link_metadata(Path::new(&pin.launch))
             && !source.is_empty()
         {
             return AppIcon::from_resource(&source, index, dpi, size);
@@ -558,6 +674,11 @@ pub unsafe fn icon(pin: &Shortcut, dpi: i32, size: i32) -> AppIcon {
     }
 }
 pub fn launch(pin: &Shortcut) -> Result<()> {
+    ultra_bar_native_ui::diagnostics::event(
+        "tasks",
+        "shortcut.launch_requested",
+        serde_json::json!({"name":pin.name,"executable":pin.executable,"launch":pin.launch}),
+    );
     unsafe {
         ensure!(
             ShellExecuteW(
@@ -575,30 +696,88 @@ pub fn launch(pin: &Shortcut) -> Result<()> {
     }
     Ok(())
 }
-pub unsafe fn choose(owner: HWND) -> Option<PathBuf> {
-    unsafe {
-        let mut buffer = [0u16; 32768];
-        let filter: Vec<u16> = "应用与快捷方式\0*.exe;*.lnk\0\0".encode_utf16().collect();
-        let mut dialog: OPENFILENAMEW = zeroed();
-        dialog.lStructSize = size_of::<OPENFILENAMEW>() as _;
-        dialog.hwndOwner = owner;
-        dialog.lpstrFilter = filter.as_ptr();
-        dialog.lpstrFile = buffer.as_mut_ptr();
-        dialog.nMaxFile = buffer.len() as u32;
-        dialog.Flags = OFN_EXPLORER
-            | OFN_FILEMUSTEXIST
-            | OFN_PATHMUSTEXIST
-            | OFN_NOCHANGEDIR
-            | OFN_NODEREFERENCELINKS;
-        if GetOpenFileNameW(&mut dialog) == 0 {
-            return None;
+pub fn link_run_details(path: &Path) -> Result<(String, String)> {
+    let (_, _, _, arguments, directory) = link_metadata(path)?;
+    Ok((arguments, directory))
+}
+// Taskband's binary layout is private. Extract only bounded AUMID candidates,
+// then require Shell to resolve each installed AppsFolder item. Never mutate Taskband.
+fn packaged_candidates(bytes: &[u8]) -> Vec<String> {
+    let mut result = Vec::new();
+    for alignment in 0..2 {
+        let words: Vec<u16> = bytes[alignment.min(bytes.len())..]
+            .chunks_exact(2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+            .collect();
+        for part in words.split(|c| !matches!(*c, 45..=46 | 48..=57 | 65..=90 | 95 | 97..=122 | 33))
+        {
+            if !(5..=512).contains(&part.len()) {
+                continue;
+            }
+            let text = String::from_utf16_lossy(part);
+            let Some((package, app)) = text.split_once('!') else {
+                continue;
+            };
+            if !package.contains('_') || app.is_empty() || app.contains('!') {
+                continue;
+            }
+            if !result
+                .iter()
+                .any(|old: &String| old.eq_ignore_ascii_case(&text))
+            {
+                result.push(text);
+            }
+            if result.len() >= 128 {
+                return result;
+            }
         }
-        Some(
-            String::from_utf16_lossy(
-                &buffer[..buffer.iter().position(|v| *v == 0).unwrap_or(buffer.len())],
-            )
-            .into(),
-        )
+    }
+    result
+}
+pub fn packaged_system_pins() -> Vec<Shortcut> {
+    let Some(bytes) = taskband_order() else {
+        return vec![];
+    };
+    unsafe {
+        let hr = CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
+        let _apartment = Apartment(hr >= 0);
+        packaged_candidates(&bytes)
+            .into_iter()
+            .filter_map(|id| {
+                let launch = format!("shell:AppsFolder\\{id}");
+                let mut pidl = null_mut();
+                if SHParseDisplayName(wide(&launch).as_ptr(), null_mut(), &mut pidl, 0, null_mut())
+                    < 0
+                    || pidl.is_null()
+                {
+                    return None;
+                }
+                let mut info: SHFILEINFOW = zeroed();
+                let valid = SHGetFileInfoW(
+                    pidl.cast(),
+                    0,
+                    &mut info,
+                    size_of::<SHFILEINFOW>() as u32,
+                    SHGFI_PIDL | SHGFI_DISPLAYNAME,
+                ) != 0;
+                CoTaskMemFree(pidl.cast());
+                let name = String::from_utf16_lossy(
+                    &info.szDisplayName[..info
+                        .szDisplayName
+                        .iter()
+                        .position(|c| *c == 0)
+                        .unwrap_or(info.szDisplayName.len())],
+                );
+                if !valid || name.is_empty() {
+                    return None;
+                }
+                Some(Shortcut {
+                    launch,
+                    executable: format!("appx:{id}"),
+                    name,
+                })
+            })
+            .collect()
     }
 }
 pub fn system_pins() -> Vec<PathBuf> {
@@ -619,8 +798,8 @@ pub fn system_pins() -> Vec<PathBuf> {
                 .is_some_and(|ext| ext.eq_ignore_ascii_case("lnk"))
         })
         .collect();
-    // Taskband is undocumented. Only use matching filenames as a best-effort
-    // ordering hint; never parse opaque records or write Explorer's settings.
+    // Taskband is undocumented. Matching filenames provide a best-effort ordering
+    // hint; do not depend on binary record offsets or write Explorer's settings.
     if let Some(bytes) = taskband_order() {
         paths.sort_by_key(|path| {
             let pattern: Vec<u8> = path
@@ -746,6 +925,39 @@ mod tests {
         assert!(pin.name.contains("测试"));
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(&root).unwrap();
+    }
+    #[test]
+    fn packaged_candidates_require_an_app_id_and_preserve_order() {
+        let bytes: Vec<u8> = "noise\0Microsoft.WindowsStore_8wekyb3d8bbwe!App\0C:\\folder\\ordinary.exe\0OpenAI.Codex_2p2nqsd0c76g0!App\0Microsoft.WindowsStore_8wekyb3d8bbwe!App\0".encode_utf16().flat_map(u16::to_le_bytes).collect();
+        let ids = packaged_candidates(&bytes);
+        assert_eq!(
+            ids,
+            [
+                "Microsoft.WindowsStore_8wekyb3d8bbwe!App",
+                "OpenAI.Codex_2p2nqsd0c76g0!App"
+            ]
+        );
+        assert!(packaged_candidates(&[]).is_empty());
+    }
+    #[test]
+    fn packaged_windows_share_their_pinned_slot_across_hosts() {
+        let id = "Microsoft.WindowsStore_8wekyb3d8bbwe!App";
+        let pin = Shortcut {
+            launch: format!("shell:AppsFolder\\{id}"),
+            executable: format!("appx:{id}"),
+            name: "Microsoft Store".into(),
+        };
+        let groups = group(
+            &[pin],
+            vec![
+                "C:/Windows/System32/ApplicationFrameHost.exe",
+                "C:/Program Files/WindowsApps/Store/WinStore.App.exe",
+            ],
+            |exe| task_identity(exe, 1, Some(id)),
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1.len(), 2);
+        assert!(groups[0].2.is_some());
     }
     #[test]
     fn pinned_slot_survives_start_multi_window_and_exit() {

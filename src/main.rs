@@ -1,8 +1,11 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
+macro_rules! eprintln {($($arg:tt)*)=>{ultra_bar_native_ui::diagnostic_stderr!($($arg)*)};}
 mod clock;
 mod clock_feed;
 mod color_picker;
 mod data_paths;
+mod diagnostic_watch;
+mod editors;
 mod input_dialog;
 mod jump_list;
 mod lifecycle;
@@ -10,7 +13,10 @@ mod plugin_panels;
 mod plugin_services;
 mod plugin_system;
 mod plugins;
+mod script_shortcuts;
 mod settings;
+mod settings_editor;
+mod settings_window;
 mod shell;
 mod task_apps;
 mod task_badge;
@@ -38,7 +44,98 @@ pub struct Options {
 }
 
 fn main() -> Result<()> {
+    let role = if std::env::args().nth(1).as_deref() == Some("--restore-watch") {
+        "recovery"
+    } else {
+        "host"
+    };
+    let log_probe = std::env::args().nth(1).as_deref() == Some("--log-smoke");
+    let directory = if log_probe {
+        Some(PathBuf::from(
+            std::env::args().nth(2).context("缺少日志验证目录")?,
+        ))
+    } else {
+        None
+    };
+    let logs =
+        ultra_bar_native_ui::diagnostics::init_in(role, env!("CARGO_PKG_VERSION"), directory)?;
+    ultra_bar_native_ui::diagnostics::event(
+        "lifecycle",
+        "invocation",
+        serde_json::json!({"mode":std::env::args().nth(1).filter(|s|s.starts_with("--")).unwrap_or_else(||"run".into())}),
+    );
+    let result = run();
+    ultra_bar_native_ui::diagnostics::event(
+        "lifecycle",
+        "process.end",
+        serde_json::json!({"ok":result.is_ok(),"error":result.as_ref().err().map(|e|format!("{e:#}"))}),
+    );
+    drop(logs);
+    result
+}
+fn run() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--log-smoke") {
+        return ultra_bar_native_ui::diagnostics::smoke(std::path::Path::new(
+            &std::env::args().nth(2).context("缺少日志验证目录")?,
+        ))
+        .map_err(Into::into);
+    }
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|s| s == "--editor-host-smoke") {
+        return unsafe {
+            editors::smoke(
+                &PathBuf::from(args.get(2).context("缺少验证目录")?),
+                args.get(3).map(std::path::Path::new),
+            )
+        };
+    }
+    if args.get(1).is_some_and(|s| s == "--script-execution-smoke") {
+        return script_shortcuts::execution_smoke(&PathBuf::from(
+            args.get(2).context("缺少验证目录")?,
+        ));
+    }
+    if args.get(1).is_some_and(|s| s == "--run-pinned-script") {
+        if let Some(root) = std::env::var_os("ULTRA_BAR_SCRIPT_DATA_ROOT") {
+            data_paths::set(PathBuf::from(root))?;
+        }
+        let result = script_shortcuts::run(args.get(2).context("缺少脚本入口")?);
+        if let Err(error) = &result {
+            unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                    std::ptr::null_mut(),
+                    visual::wide(&format!("{error:#}")).as_ptr(),
+                    visual::wide("运行脚本").as_ptr(),
+                    windows_sys::Win32::UI::WindowsAndMessaging::MB_OK
+                        | windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+                );
+            }
+        }
+        return result;
+    }
+    if args.get(1).is_some_and(|s| s == "--service-diagnose") {
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::*;
+            let hwnd = FindWindowW(visual::wide("UltraBar.Window").as_ptr(), std::ptr::null());
+            let mut result = 0;
+            anyhow::ensure!(
+                !hwnd.is_null()
+                    && SendMessageTimeoutW(
+                        hwnd,
+                        RegisterWindowMessageW(
+                            visual::wide("UltraBar.ServiceDiagnostics.v1").as_ptr()
+                        ),
+                        usize::from(args.get(2).is_some_and(|s| s == "--show-agent")),
+                        0,
+                        SMTO_ABORTIFHUNG | SMTO_BLOCK,
+                        1500,
+                        &mut result
+                    ) != 0
+                    && result == 1,
+                "无法读取任务栏插件状态"
+            );
+            return Ok(());
+        }
+    }
     if args.get(1).map(String::as_str) == Some("--task-window-details") {
         return shell::diagnose_task_windows(
             args.get(2).context("缺少进程 ID")?.parse()?,

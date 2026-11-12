@@ -1,0 +1,22 @@
+name: Keep three build runs
+on:
+  workflow_run:
+    workflows: ['Windows installer']
+    types: [completed]
+  workflow_dispatch:
+permissions:
+  contents: read
+  actions: write
+concurrency:
+  group: actions-retention
+  cancel-in-progress: false
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keep latest three runs and their artifacts
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./scripts/prune-actions.ps1 -Keep 3

@@ -1,5 +1,6 @@
 //! One upper-left light: raised outer shadows and recessed inner shadows.
-//! Raster tiles are cached; no animation, border strokes, or per-frame lighting work.
+//! Raster tiles cache shadows and a thin accent outline; no per-frame lighting work.
+use crate::settings::ActiveStyle;
 use crate::visual::text::draw_text as DrawTextW;
 use crate::visual::{
     Surface,
@@ -14,6 +15,7 @@ struct Key {
     dpi: i32,
     accent: u32,
     pressed: bool,
+    style: ActiveStyle,
     hover: bool,
     attention: bool,
 }
@@ -106,8 +108,8 @@ fn sample(key: Key, mat: Material, x: f64, y: f64) -> u32 {
     let sdf = |x, y| distance(x, y, width, height, radius);
     let coverage = (0.5 - sdf(x, y)).clamp(0., 1.);
     let size = (height / (32. * scale)).clamp(0.7, 1.);
-    let offset = 1.6 * scale * size;
-    let blur = 2.3 * scale * size;
+    let offset = if key.pressed { 2.2 } else { 1.6 } * scale * size;
+    let blur = if key.pressed { 3.0 } else { 2.3 } * scale * size;
     let mut pixel = Pixel::new(mat.background, 148. / 255.);
     if !key.pressed {
         let dark = blurred_inside(sdf(x - offset, y - offset), blur) * (1. - coverage) * 0.72;
@@ -118,6 +120,34 @@ fn sample(key: Key, mat: Material, x: f64, y: f64) -> u32 {
         pixel.over(mat.dark, dark);
         pixel.over(mat.light, light);
     } else if coverage == 0. {
+        if key.style == ActiveStyle::Underline {
+            let bar_width = (width * 0.72)
+                .min(44. * scale)
+                .max(18. * scale)
+                .min(width - 4. * scale)
+                .max(scale);
+            let bar = distance(
+                x - (width - bar_width) / 2.,
+                y - (height + 3. * scale),
+                bar_width,
+                2. * scale,
+                scale,
+            );
+            let amount = (0.5 - bar).clamp(0., 1.);
+            if amount == 0. {
+                return 0;
+            }
+            return Pixel::new(
+                Hsl {
+                    h: mat.h,
+                    s: (mat.s * 0.9).clamp(0.50, 0.85),
+                    l: 0.65,
+                }
+                .rgb(),
+                amount,
+            )
+            .rgba();
+        }
         return 0;
     }
     let direction = ((x / width - 0.5) + (y / height - 0.5)).clamp(-1., 1.);
@@ -132,7 +162,8 @@ fn sample(key: Key, mat: Material, x: f64, y: f64) -> u32 {
     } else {
         material.s
     };
-    let lightness = material.l - direction * if key.pressed { 0.005 } else { 0.018 }
+    let lightness = material.l
+        + direction * if key.pressed { 0.016 } else { -0.018 }
         + if key.hover { 0.010 } else { 0. };
     let face = Hsl {
         h: hue,
@@ -144,10 +175,42 @@ fn sample(key: Key, mat: Material, x: f64, y: f64) -> u32 {
     if key.pressed {
         // Same shadow offset as the raised case, applied to the inverted mask:
         // upper-left occlusion and lower-right reflected light inside the cavity.
-        let dark = (1. - blurred_inside(sdf(x - offset, y - offset), blur)) * coverage * 0.82;
-        let light = (1. - blurred_inside(sdf(x + offset, y + offset), blur)) * coverage * 0.38;
+        let dark = (1. - blurred_inside(sdf(x - offset, y - offset), blur)) * coverage * 0.96;
+        let light = (1. - blurred_inside(sdf(x + offset, y + offset), blur)) * coverage * 0.64;
         pixel.over(mat.inner_dark, dark);
+        // A tight contact shadow sits beneath the broader cavity shadow.
+        let contact = (1. - blurred_inside(sdf(x - 0.7 * scale, y - 0.7 * scale), 0.65 * scale))
+            * coverage
+            * 0.38;
+        pixel.over(mat.inner_dark, contact);
         pixel.over(mat.inner_light, light);
+    }
+    if key.pressed {
+        match key.style {
+            ActiveStyle::Inset => {}
+            ActiveStyle::Underline => {}
+            ActiveStyle::TopDot => {
+                let radius = 1.35 * scale;
+                let dot = (x - width / 2.).hypot(y - 2.5 * scale) - radius;
+                let rim = (0.5 - (dot - 0.65 * scale)).clamp(0., 1.) * coverage;
+                pixel.over(mat.inner_light, rim * 0.60);
+                pixel.over(
+                    Hsl {
+                        h: mat.h,
+                        s: mat.s * 0.15,
+                        l: 0.015,
+                    }
+                    .rgb(),
+                    (0.5 - dot).clamp(0., 1.) * coverage,
+                );
+            }
+        }
+    }
+    if !key.pressed {
+        // Keep the raised outline inside the item, preserving the two-pixel gaps.
+        let inner = (0.5 - (sdf(x, y) + scale)).clamp(0., 1.);
+        let outline = (coverage - inner).max(0.);
+        pixel.over(key.accent, outline * if key.hover { 0.60 } else { 0.48 });
     }
     pixel.rgba()
 }
@@ -179,12 +242,21 @@ pub unsafe fn draw(
     rect: &RECT,
     dpi: i32,
     pressed: bool,
+    style: ActiveStyle,
     attention: bool,
     hover: bool,
 ) {
     unsafe {
         let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
+        // Reserve a separate lower lane for the indicator. The icon and hit box
+        // keep their original positions; the cavity itself ends above that lane.
+        let height = rect.bottom
+            - rect.top
+            - if pressed && style == ActiveStyle::Underline {
+                (2 * dpi / 96).max(1)
+            } else {
+                0
+            };
         if width < 2 || height < 2 {
             return;
         }
@@ -194,6 +266,7 @@ pub unsafe fn draw(
             dpi,
             accent: theme::accent_rgb(),
             pressed,
+            style,
             attention,
             hover,
         };
@@ -225,10 +298,12 @@ pub unsafe fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
     unsafe {
         std::fs::create_dir_all(directory)?;
         let original = theme::accent_rgb();
-        for (name, accent) in [
-            ("blue", theme::DEFAULT_ACCENT),
-            ("purple", 0xb96df0),
-            ("green", 0x36c7a1),
+        for (name, accent, style) in [
+            ("blue", theme::DEFAULT_ACCENT, ActiveStyle::Underline),
+            ("blue-dot", theme::DEFAULT_ACCENT, ActiveStyle::TopDot),
+            ("blue-inset", theme::DEFAULT_ACCENT, ActiveStyle::Inset),
+            ("purple", 0xb96df0, ActiveStyle::Underline),
+            ("green", 0x36c7a1, ActiveStyle::Underline),
         ] {
             theme::set_accent(accent);
             let p = theme::palette();
@@ -270,14 +345,14 @@ pub unsafe fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
                     right: x + 214,
                     bottom: 90,
                 };
-                draw(&surface, &rect, 96, index == 1, false, index == 2);
+                draw(&surface, &rect, 96, index == 1, style, false, index == 2);
                 let small = RECT {
                     left: x + 6,
                     top: 116,
                     right: x + 40,
                     bottom: 138,
                 };
-                draw(&surface, &small, 96, index == 1, false, index == 2);
+                draw(&surface, &small, 96, index == 1, style, false, index == 2);
             }
             SelectObject(surface.dc, old);
             surface.save_bmp(&directory.join(format!("task-relief-{name}.bmp")))?;
@@ -296,6 +371,7 @@ mod tests {
             dpi: 96,
             accent: theme::DEFAULT_ACCENT,
             pressed,
+            style: ActiveStyle::Inset,
             attention: false,
             hover: false,
         }
@@ -320,6 +396,79 @@ mod tests {
             light(sample(raised, mat, 50., 16.)) > light(sample(recessed, mat, 50., 16.)),
             "recessed floor must be darker than raised material"
         );
+    }
+    #[test]
+    fn markers_preserve_the_inset_floor_and_use_a_separate_lower_lane() {
+        for dpi in [96, 144, 192] {
+            let scale = dpi as f64 / 96.;
+            let base = Key {
+                dpi,
+                width: 40 * dpi / 96,
+                height: 24 * dpi / 96,
+                ..key(true)
+            };
+            let mat = material(base.accent);
+            let center = (base.width as f64 / 2., base.height as f64 / 2.);
+            for style in [ActiveStyle::Underline, ActiveStyle::TopDot] {
+                let active = Key { style, ..base };
+                assert_eq!(
+                    sample(active, mat, center.0, center.1),
+                    sample(base, mat, center.0, center.1)
+                );
+                assert_eq!(sample(active, mat, -1., center.1), 0);
+                let raised = Key {
+                    pressed: false,
+                    style,
+                    ..base
+                };
+                assert_eq!(
+                    sample(raised, mat, center.0, center.1),
+                    sample(
+                        Key {
+                            style: ActiveStyle::Inset,
+                            ..raised
+                        },
+                        mat,
+                        center.0,
+                        center.1
+                    )
+                );
+            }
+            let underline = Key {
+                style: ActiveStyle::Underline,
+                ..base
+            };
+            assert_eq!(
+                sample(underline, mat, center.0, base.height as f64 - 2.5 * scale),
+                sample(base, mat, center.0, base.height as f64 - 2.5 * scale)
+            );
+            assert_eq!(
+                sample(underline, mat, center.0, base.height as f64 + 1.5 * scale),
+                0,
+                "clear gap below the cavity"
+            );
+            let bar = sample(underline, mat, center.0, base.height as f64 + 4. * scale);
+            assert_eq!(bar >> 24, 255);
+            assert!(light(bar) > 0.6);
+            assert_ne!(
+                sample(
+                    underline,
+                    mat,
+                    center.0 + 9. * scale,
+                    base.height as f64 + 4. * scale
+                ),
+                0,
+                "indicator is wider than the former twelve-pixel marker"
+            );
+            let dot = Key {
+                style: ActiveStyle::TopDot,
+                ..base
+            };
+            assert!(
+                light(sample(dot, mat, center.0, 2.5 * scale))
+                    < light(sample(base, mat, center.0, 2.5 * scale))
+            );
+        }
     }
     #[test]
     fn shadow_colours_keep_primary_hue_and_avoid_luminous_saturation() {

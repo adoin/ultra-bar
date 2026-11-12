@@ -177,6 +177,11 @@ fn worker(
                     snapshot.active = source.id;
                 }
                 Request::Remove => {
+                    ultra_bar_native_ui::diagnostics::event(
+                        "plugins",
+                        "repository.remove_requested",
+                        serde_json::json!({"source_id":snapshot.active}),
+                    );
                     ensure!(sources_writable, "仓库配置无法读取，未覆盖原文件");
                     ensure!(
                         snapshot.active != OFFICIAL_ID && snapshot.active != "installed",

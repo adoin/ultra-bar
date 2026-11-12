@@ -21,25 +21,156 @@ pub fn capture(directory: &std::path::Path, dpi: i32, fields: Vec<Field>) -> std
     CAPTURE.with(|c| *c.borrow_mut() = None);
     Ok(())
 }
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Kind {
     Text,
     Secret,
     Choice(Vec<String>),
     Link,
 }
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct Field {
     pub label: String,
     pub value: String,
     pub kind: Kind,
+    #[serde(skip)]
+    pub validate: Option<Validator>,
 }
+pub type Validator = fn(&str) -> Result<(), String>;
+pub fn switch_state(field: &Field) -> Option<bool> {
+    let Kind::Choice(choices) = &field.kind else {
+        return None;
+    };
+    if choices.len() != 2 {
+        return None;
+    }
+    let binary = |value: &str| match value.trim().to_ascii_lowercase().as_str() {
+        "开启" | "启用" | "显示" | "是" | "on" | "true" => Some(true),
+        "关闭" | "禁用" | "隐藏" | "否" | "off" | "false" => Some(false),
+        _ => None,
+    };
+    let a = binary(&choices[0])?;
+    let b = binary(&choices[1])?;
+    if a == b {
+        return None;
+    }
+    Some(if field.value == "1" { b } else { a })
+}
+#[cfg(test)]
+mod switch_tests {
+    use super::*;
+    #[test]
+    fn switches_follow_boolean_meanings_without_turning_two_way_selections_into_toggles() {
+        assert_eq!(
+            switch_state(&Field::choice("开关", 1, &["关闭", "开启"])),
+            Some(true)
+        );
+        assert_eq!(
+            switch_state(&Field::choice("开关", 0, &["关闭", "开启"])),
+            Some(false)
+        );
+        assert_eq!(
+            switch_state(&Field::choice("反序", 0, &["开启", "关闭"])),
+            Some(true)
+        );
+        assert_eq!(
+            switch_state(&Field::choice("农历", 0, &["隐藏", "显示"])),
+            Some(false)
+        );
+        assert_eq!(
+            switch_state(&Field::choice("星期", 0, &["星期一", "星期日"])),
+            None
+        );
+        assert_eq!(
+            switch_state(&Field::choice("单位", 0, &["摄氏度 °C", "华氏度 °F"])),
+            None
+        );
+        assert_eq!(
+            switch_state(&Field::choice(
+                "模式",
+                0,
+                &["仅时间", "并排展示", "轮播展示"]
+            )),
+            None
+        );
+    }
+}
+/// # Safety
+/// Draw on the UI thread using a valid target DC.
+pub unsafe fn draw_switch(dc: HDC, bounds: RECT, checked: bool, enabled: bool) {
+    unsafe {
+        let w = bounds.right - bounds.left;
+        let h = bounds.bottom - bounds.top;
+        if h <= 0 || w < h {
+            return;
+        }
+        let p = theme::palette();
+        let base = theme::colorref(p.field);
+        let track = theme::colorref(if checked && enabled {
+            p.accent
+        } else {
+            p.disabled
+        });
+        let knob = theme::colorref(p.text);
+        let blend = |a: u32, b: u32, t: f64| -> u32 {
+            let c = |shift: u32| {
+                ((((a >> shift) & 255u32) as f64 * (1. - t) + ((b >> shift) & 255u32) as f64 * t)
+                    .round() as u32)
+                    << shift
+            };
+            c(16) | c(8) | c(0)
+        };
+        let radius = h as f64 / 2.;
+        let gap = (h as f64 / 12.).max(2.);
+        let inner = radius - gap;
+        let center = if checked {
+            w as f64 - gap - inner
+        } else {
+            gap + inner
+        };
+        let mut pixels = Vec::with_capacity((w * h) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                let (x, y) = (x as f64 + 0.5, y as f64 + 0.5);
+                let cap = (0.5
+                    - ((x - x.clamp(radius, w as f64 - radius)).hypot(y - radius) - radius))
+                    .clamp(0., 1.);
+                let thumb = (0.5 - ((x - center).hypot(y - radius) - inner)).clamp(0., 1.);
+                pixels.push(0xff000000 | blend(blend(base, track, cap), knob, thumb));
+            }
+        }
+        let mut info: BITMAPINFO = zeroed();
+        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as _;
+        info.bmiHeader.biWidth = w;
+        info.bmiHeader.biHeight = -h;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        SetDIBitsToDevice(
+            dc,
+            bounds.left,
+            bounds.top,
+            w as _,
+            h as _,
+            0,
+            0,
+            0,
+            h as _,
+            pixels.as_ptr().cast(),
+            &info,
+            DIB_RGB_COLORS,
+        );
+    }
+}
+
 impl Field {
     pub fn text(label: &str, value: impl Into<String>) -> Self {
         Self {
             label: label.into(),
             value: value.into(),
             kind: Kind::Text,
+            validate: None,
         }
     }
     pub fn secret(label: &str) -> Self {
@@ -47,6 +178,7 @@ impl Field {
             label: label.into(),
             value: String::new(),
             kind: Kind::Secret,
+            validate: None,
         }
     }
     pub fn choice(label: &str, index: usize, choices: &[&str]) -> Self {
@@ -54,6 +186,7 @@ impl Field {
             label: label.into(),
             value: index.to_string(),
             kind: Kind::Choice(choices.iter().map(|s| s.to_string()).collect()),
+            validate: None,
         }
     }
     pub fn link(label: &str, url: &str) -> Self {
@@ -61,7 +194,14 @@ impl Field {
             label: label.into(),
             value: url.into(),
             kind: Kind::Link,
+            validate: None,
         }
+    }
+}
+impl Field {
+    pub fn validated(mut self, validate: Validator) -> Self {
+        self.validate = Some(validate);
+        self
     }
 }
 struct State {
@@ -78,6 +218,7 @@ struct State {
     done: bool,
     saved: bool,
     title: String,
+    error: String,
 }
 /// # Safety
 /// Owner must belong to this UI thread, or be null.
@@ -133,6 +274,7 @@ pub unsafe fn edit(owner: HWND, title: &str, fields: Vec<Field>) -> Option<Vec<S
             done: false,
             saved: false,
             title: title.into(),
+            error: String::new(),
         });
         let mut height = scale(100 + s.fields.len() as i32 * 53);
         let width = scale(490);
@@ -197,6 +339,7 @@ pub unsafe fn edit(owner: HWND, title: &str, fields: Vec<Field>) -> Option<Vec<S
                 );
                 SendMessageW(edit, WM_SETFONT, s.font as usize, 1);
                 SendMessageW(edit, EM_SETLIMITTEXT, 4096, 0);
+                crate::input::attach(edit);
                 edit
             } else {
                 null_mut()
@@ -375,6 +518,25 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                 if (y < 40 && x > 440) || (y > bottom - 45 && x > 430) {
                     s.done = true;
                 } else if y > bottom - 45 && x > 380 {
+                    s.error.clear();
+                    for (i, field) in s.fields.iter().enumerate() {
+                        if let Some(validate) = field.validate {
+                            let mut text = vec![0u16; 4097];
+                            let n =
+                                GetWindowTextW(s.controls[i], text.as_mut_ptr(), text.len() as _);
+                            let value = if s.controls[i].is_null() {
+                                field.value.clone()
+                            } else {
+                                String::from_utf16_lossy(&text[..n.max(0) as usize])
+                            };
+                            if let Err(error) = validate(&value) {
+                                s.error = error;
+                                SetFocus(s.controls[i]);
+                                InvalidateRect(hwnd, null(), 0);
+                                return 0;
+                            }
+                        }
+                    }
                     s.saved = true;
                     s.done = true;
                 } else if y >= 67 && y < bottom - 50 {
@@ -447,7 +609,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                         RoundRect(
                             dc,
                             scale(18),
-                            scale(y + 22),
+                            scale(if switch_state(f).is_some() { y } else { y + 22 }),
                             scale(472),
                             scale(y + 47),
                             scale(8),
@@ -456,6 +618,21 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                         SelectObject(dc, old);
                         SelectObject(dc, pen);
                         DeleteObject(brush);
+                        if let Some(checked) = switch_state(f) {
+                            text(&f.label, 25, y + 9, 360, 30, p.text);
+                            draw_switch(
+                                dc,
+                                RECT {
+                                    left: scale(416),
+                                    top: scale(y + 13),
+                                    right: scale(458),
+                                    bottom: scale(y + 37),
+                                },
+                                checked,
+                                true,
+                            );
+                            continue;
+                        }
                         text(&f.label, 18, y, 454, 21, p.muted);
                         match &f.kind {
                             Kind::Choice(v) => {
@@ -476,6 +653,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                         }
                     }
                     RestoreDC(dc, saved);
+                    text(&s.error, 18, s.height - 40, 350, 30, p.text);
                     let content = 100 + s.fields.len() as i32 * 53;
                     if content > s.height {
                         let track = s.height - 112;
@@ -496,7 +674,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                     let bottom = s.height;
                     text("\u{e73e}", 390, bottom - 40, 30, 30, p.text);
                     text("\u{e711}", 440, bottom - 40, 30, 30, p.muted);
-                    BitBlt(ps.hdc, 0, 0, rect.right, rect.bottom, dc, 0, 0, SRCCOPY);
+                    surface.blit_opaque(ps.hdc);
                     if let Some(path) = s.capture.take() {
                         for control in &s.controls {
                             if control.is_null() || IsWindowVisible(*control) == 0 {

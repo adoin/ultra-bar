@@ -1,10 +1,17 @@
+mod hover;
+mod hover_popup;
+pub use hover_popup::event as hover_popup_event;
 mod native;
 mod observer;
 mod popup;
 mod registry;
 mod store;
 use anyhow::Result;
+pub use hover::HOVER_TIMER;
+pub use hover::Hover;
+pub use native::HoverEvent;
 pub use native::diagnose_details;
+pub(crate) use native::restore_hover_positions;
 pub use native::{Click, event};
 pub use observer::smoke as sync_smoke;
 pub use popup::Popup;
@@ -13,6 +20,22 @@ use std::sync::{
     atomic::Ordering,
     mpsc::{self, Receiver, SyncSender},
 };
+
+// Check only during the brief icon-to-preview handoff or while the user is
+// interacting with that external preview. Idle trays block without a timer.
+fn receive(requests: &Receiver<Command>) -> std::result::Result<Command, mpsc::RecvError> {
+    loop {
+        hover_popup::tick();
+        if !hover_popup::pending_close() {
+            return requests.recv();
+        }
+        match requests.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(command) => return Ok(command),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return Err(mpsc::RecvError),
+        }
+    }
+}
 
 pub struct Snapshot {
     pub items: Vec<native::Item>,
@@ -59,6 +82,7 @@ pub enum Command {
     SetCollapsed(String, bool),
     Click(String, Click),
     FramesChanged,
+    Hover(String, HoverEvent, (i32, i32)),
     Stop,
 }
 pub struct Host {
@@ -90,14 +114,55 @@ impl Host {
                 }
             }
             let mut current = Arc::new(Snapshot::empty());
+            let mut hovered: Option<(String, native::HoverTarget, (i32, i32))> = None;
             let mut command = Command::Refresh;
             loop {
                 if matches!(command, Command::Stop) || frames.stopped() {
                     break;
                 }
+                if let Command::Hover(ref key, event, point) = command {
+                    if event != HoverEvent::Close
+                        && hovered.as_ref().is_some_and(|(old, _, _)| old != key)
+                        && let Some((_, target, old_point)) = hovered.take()
+                    {
+                        let _ = target.relay(HoverEvent::Close, old_point);
+                    }
+                    if hovered.is_none()
+                        && event != HoverEvent::Close
+                        && let Some(item) = current.items.iter().find(|item| item.key == *key)
+                        && let Ok(target) = native::HoverTarget::new(&item.endpoint)
+                    {
+                        hovered = Some((key.clone(), target, point));
+                    }
+                    if let Some((active, target, last)) = hovered.as_mut()
+                        && active == key
+                    {
+                        *last = point;
+                        if target.relay(event, point).is_err() {
+                            hovered = None;
+                        }
+                    }
+                    if event == HoverEvent::Close
+                        && hovered.as_ref().is_some_and(|(active, _, _)| active == key)
+                    {
+                        hovered = None;
+                    }
+                    match receive(&requests) {
+                        Ok(next) => command = next,
+                        Err(_) => break,
+                    }
+                    continue;
+                }
                 if matches!(command, Command::FramesChanged) {
                     let mut items = current.items.clone();
                     if frames.apply(&mut items) {
+                        if hovered
+                            .as_ref()
+                            .is_some_and(|(key, _, _)| !items.iter().any(|item| &item.key == key))
+                            && let Some((_, target, point)) = hovered.take()
+                        {
+                            let _ = target.relay(HoverEvent::Close, point);
+                        }
                         current = Arc::new(Snapshot {
                             items,
                             preferences: current.preferences.clone(),
@@ -113,7 +178,7 @@ impl Host {
                             );
                         }
                     }
-                    match requests.recv() {
+                    match receive(&requests) {
                         Ok(next) => command = next,
                         Err(_) => break,
                     }
@@ -129,11 +194,26 @@ impl Host {
                     status = "图标暂不可用，请刷新后重试".into();
                 }
                 let mut items = native::enumerate().unwrap_or_else(|error| {
+                    ultra_bar_native_ui::diagnostics::event("tray","enumeration.failed",serde_json::json!({"error":format!("{error:#}"),"retained_count":current.items.len()}));
                     eprintln!("[tray] enumeration: {error:#}");
                     status = "暂时无法读取原生托盘图标".into();
-                    vec![]
+                    current.items.clone()
                 });
+                if items.len() != current.items.len() {
+                    ultra_bar_native_ui::diagnostics::event(
+                        "tray",
+                        "snapshot.changed",
+                        serde_json::json!({"before_count":current.items.len(),"after_count":items.len(),"keys":items.iter().map(|i|i.key.as_str()).collect::<Vec<_>>()}),
+                    );
+                }
                 frames.apply(&mut items);
+                if hovered
+                    .as_ref()
+                    .is_some_and(|(key, _, _)| !items.iter().any(|item| &item.key == key))
+                    && let Some((_, target, point)) = hovered.take()
+                {
+                    let _ = target.relay(HoverEvent::Close, point);
+                }
                 let from_live = |collapsed_override: Option<bool>| {
                     items.iter().map(move |item| store::Preference {
                         id: item.preference_key.clone(),
@@ -224,10 +304,13 @@ impl Host {
                         owner as _, message, 0, 0,
                     );
                 }
-                match requests.recv() {
+                match receive(&requests) {
                     Ok(next) => command = next,
                     Err(_) => break,
                 }
+            }
+            if let Some((_, target, point)) = hovered {
+                let _ = target.relay(HoverEvent::Close, point);
             }
         });
         Self {

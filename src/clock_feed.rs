@@ -127,7 +127,21 @@ impl Feed {
                 _ => time,
             }
         };
-        (template.replace("{time}", &text), summary.tooltip.clone())
+        let mut tip = summary
+            .tooltip
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if tip.is_empty() {
+            tip = regional_time("YYYY-MM-DD dddd HH:mm", summary.utc_offset_seconds)
+                .unwrap_or_else(|| text.clone());
+            if !summary.lunar.trim().is_empty() {
+                tip.push_str(&format!("\n{}", summary.lunar.trim()));
+            }
+        }
+        (template.replace("{time}", &text), tip)
     }
 }
 impl Drop for Feed {
@@ -188,8 +202,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        let (text, _) = feed.render("calendar", "{time}", "fallback", "HH:mm");
+        feed.summaries.get_mut("calendar").unwrap().tooltip = "\n \n\t".into();
+        let (text, tip) = feed.render("calendar", "{time}", "fallback", "HH:mm");
         assert!(text.ends_with("正月初一  晴 16°C"));
+        assert!(tip.contains("星期"));
+        assert!(!tip.trim().is_empty());
         feed.summaries.get_mut("calendar").unwrap().display = 2;
         feed.phase = 1;
         assert_eq!(

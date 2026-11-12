@@ -1,6 +1,5 @@
 //! DWM advances a repeating visual transform. No application frame timer or render loop.
 use super::*;
-use crate::visual::text::draw_text as DrawTextW;
 use anyhow::{Context, Result};
 use ultra_bar_plugin_sdk::Page;
 use windows::{
@@ -21,6 +20,8 @@ pub struct Meter {
     pub bounds: (i32, i32, i32, i32),
     pub progress: Option<f64>,
     pub text: String,
+    pub trailing: String,
+    pub previous_trailing: String,
     pub previous: Option<String>,
     pub phase: f64,
     pub font: usize,
@@ -333,11 +334,17 @@ impl Compositor {
             let fill = spec
                 .progress
                 .filter(|n| n.is_finite())
-                .map(|n| (n.clamp(0., 1.) * w as f64).round() as i32)
+                .map(|n| (n.clamp(0., 1.) * FILL_SCALE as f64).round() as i32)
                 .unwrap_or(-1);
             let visual = self.device.CreateVisual()?;
             visual.SetOffsetX2(l as f32)?;
             visual.SetOffsetY2(t as f32)?;
+            let bounds = fill_bounds(Key {
+                width: w,
+                height: h,
+                fill,
+                accent: spec.accent,
+            });
             if fill > 0 {
                 let background = self.image(
                     w,
@@ -351,16 +358,26 @@ impl Compositor {
                 )?;
                 visual.AddVisual(&background, false, None)?;
             }
-            if fill > 0 {
+            if let Some(bounds) = bounds {
                 let container = self.device.CreateVisual()?;
-                container.SetClip(&self.clip(fill as f32, h as f32)?)?;
-                let period = h * 2;
-                let alpha = texture_at_scale(w, period, h as f64 / 32.);
+                container.SetOffsetX2(bounds.left as f32)?;
+                container.SetOffsetY2(bounds.top as f32)?;
+                container
+                    .SetClip(&self.clip((w - 2 * bounds.left) as f32, bounds.height as f32)?)?;
+                let cropped = self.device.CreateVisual()?;
+                let amount = self.device.CreateRectangleClip()?;
+                amount.SetLeft2(0.)?;
+                amount.SetTop2(0.)?;
+                amount.SetRight2(bounds.clip_width as f32)?;
+                amount.SetBottom2(bounds.height as f32)?;
+                cropped.SetClip(&amount)?;
+                let period = bounds.height * 2;
+                let alpha = texture_at_scale(bounds.width, period, bounds.height as f64 / 32.);
                 let pixels: Vec<_> = alpha
                     .into_iter()
                     .map(|a| (((a * BUBBLE_OPACITY * 255.).round() as u32) << 24) | 0xffffff)
                     .collect();
-                let surface = self.upload(w, period, &pixels)?;
+                let surface = self.upload(bounds.width, period, &pixels)?;
                 let moving = self.device.CreateVisual()?;
                 for y in [0, period] {
                     let tile = self.device.CreateVisual()?;
@@ -374,19 +391,18 @@ impl Compositor {
                     animation.AddRepeat(2., 2.)?;
                     moving.SetOffsetY(&animation)?;
                 }
-                container.AddVisual(&moving, false, None)?;
+                cropped.AddVisual(&moving, false, None)?;
+                container.AddVisual(&cropped, false, None)?;
                 visual.AddVisual(&container, false, None)?;
             }
             let inset = self.image(w, h, &super::inset_pixels(w, h, spec.accent))?;
             visual.AddVisual(&inset, false, None)?;
             let caption = caption_pixels(spec, w, h)?;
-            let shadow: Vec<_> = caption
-                .iter()
-                .map(|p| (((p >> 24) * 3 / 4) << 24) | 0x081018)
-                .collect();
-            let shade = self.image(w, h, &shadow)?;
-            shade.SetOffsetY2(1.)?;
-            visual.AddVisual(&shade, false, None)?;
+            for (radius, dy, opacity) in [(2, 1, 0.55), (1, 0, 0.95)] {
+                let shadow = super::text_shadow(&caption, w, h, radius, dy, opacity);
+                let shade = self.image(w, h, &shadow)?;
+                visual.AddVisual(&shade, false, None)?;
+            }
             let label = self.image(w, h, &caption)?;
             visual.AddVisual(&label, false, None)?;
             Ok(visual)
@@ -439,7 +455,7 @@ impl Compositor {
         }
     }
 }
-unsafe fn caption_pixels(spec: &Meter, w: i32, h: i32) -> Result<Vec<u32>> {
+pub(super) unsafe fn caption_pixels(spec: &Meter, w: i32, h: i32) -> Result<Vec<u32>> {
     unsafe {
         let surface = Surface::new(w, h).context("Cannot rasterize meter label")?;
         let area = RECT {
@@ -460,23 +476,11 @@ unsafe fn caption_pixels(spec: &Meter, w: i32, h: i32) -> Result<Vec<u32>> {
             bottom: h + displacement,
         };
         let flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
-        DrawTextW(
-            surface.dc,
-            crate::visual::wide(&spec.text).as_ptr(),
-            -1,
-            &mut rect,
-            flags,
-        );
+        super::caption(surface.dc, &rect, &spec.text, &spec.trailing, flags);
         if let Some(old) = &spec.previous {
             rect.top -= h;
             rect.bottom -= h;
-            DrawTextW(
-                surface.dc,
-                crate::visual::wide(old).as_ptr(),
-                -1,
-                &mut rect,
-                flags,
-            );
+            super::caption(surface.dc, &rect, old, &spec.previous_trailing, flags);
         }
         SelectObject(surface.dc, old);
         let pixels = surface.copy_pixels();
@@ -503,6 +507,8 @@ pub fn spec(
         bounds: (rect.left, rect.top, rect.right, rect.bottom),
         progress: page.progress,
         text: page.text.clone(),
+        trailing: page.trailing.clone(),
+        previous_trailing: old.map(|p| p.trailing.clone()).unwrap_or_default(),
         previous: old.map(|p| p.text.clone()),
         phase,
         font: font as usize,
@@ -533,9 +539,42 @@ pub unsafe fn smoke(directory: &std::path::Path) -> Result<()> {
             lpfnWndProc: Some(DefWindowProcW),
             ..std::mem::zeroed()
         });
-        let screen = GetDC(std::ptr::null_mut());
-        let underneath = GetPixel(screen, 350, 144);
-        ReleaseDC(std::ptr::null_mut(), screen);
+        // A static owned backdrop avoids sampling the user's changing wallpaper.
+        struct Window(windows_sys::Win32::Foundation::HWND);
+        impl Drop for Window {
+            fn drop(&mut self) {
+                unsafe {
+                    DestroyWindow(self.0);
+                }
+            }
+        }
+        let underneath = 0x00312720u32;
+        let backdrop_class = crate::visual::wide("UltraBar.GpuMeter.Backdrop");
+        RegisterClassW(&WNDCLASSW {
+            hInstance: module,
+            lpszClassName: backdrop_class.as_ptr(),
+            lpfnWndProc: Some(DefWindowProcW),
+            hbrBackground: CreateSolidBrush(underneath),
+            ..std::mem::zeroed()
+        });
+        let backdrop = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+            backdrop_class.as_ptr(),
+            crate::visual::wide("").as_ptr(),
+            WS_POPUP,
+            120,
+            120,
+            260,
+            48,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            module,
+            std::ptr::null(),
+        );
+        anyhow::ensure!(!backdrop.is_null(), "Cannot create static probe backdrop");
+        let _backdrop = Window(backdrop);
+        ShowWindow(backdrop, SW_SHOWNOACTIVATE);
+        UpdateWindow(backdrop);
         let hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
             class.as_ptr(),
@@ -551,14 +590,6 @@ pub unsafe fn smoke(directory: &std::path::Path) -> Result<()> {
             std::ptr::null(),
         );
         anyhow::ensure!(!hwnd.is_null(), "Cannot create composition probe");
-        struct Window(windows_sys::Win32::Foundation::HWND);
-        impl Drop for Window {
-            fn drop(&mut self) {
-                unsafe {
-                    DestroyWindow(self.0);
-                }
-            }
-        }
         let _window = Window(hwnd);
         let background = Surface::new(260, 48).context("Cannot create probe background")?;
         let area = RECT {
@@ -585,6 +616,7 @@ pub unsafe fn smoke(directory: &std::path::Path) -> Result<()> {
         let page = Page {
             id: "Codex".into(),
             text: "Codex 63%".into(),
+            trailing: "↺2".into(),
             tooltip: String::new(),
             progress: Some(0.63),
         };
@@ -650,7 +682,8 @@ pub unsafe fn smoke(directory: &std::path::Path) -> Result<()> {
         let idle_cpu_ms = (cpu() - start) as f64 / 10000.;
         anyhow::ensure!(DwmFlush() >= 0, "DWM flush failed");
         let after = capture("gpu-after.bmp")?;
-        let empty_pixel = after[24 * 260 + 230] & 0xffffff;
+        // Keep the transparency sample away from the right-aligned suffix and its shadow.
+        let empty_pixel = after[24 * 260 + 200] & 0xffffff;
         let rounded_corner_intact =
             after[8 * 260 + 10] & 0xffffff == theme::colorref(theme::palette().background);
         let transparent = empty_pixel == theme::colorref(underneath);
@@ -665,9 +698,9 @@ pub unsafe fn smoke(directory: &std::path::Path) -> Result<()> {
                 ((p >> 16) & 255) + ((p >> 8) & 255) + (p & 255) > 650
             })
             .count();
-        composition.sync(vec![spec])?;
+        composition.sync(vec![spec.clone()])?;
         let stable = uploads == composition.uploads && commits == composition.commits;
-        let record = serde_json::json!({"hardware":true,"changed_pixels":differences,"idle_cpu_ms":idle_cpu_ms,"unchanged_uploads_and_commits":stable,"application_frame_timer":false,"uploads":uploads,"commits":commits,"label_bright_pixels":label_bright_pixels,"empty_pixel_matches_desktop":transparent,"empty_region_receives_input":empty_region_receives_input,"rounded_corner_intact":rounded_corner_intact});
+        let record = serde_json::json!({"hardware":true,"changed_pixels":differences,"idle_cpu_ms":idle_cpu_ms,"unchanged_uploads_and_commits":stable,"application_frame_timer":false,"uploads":uploads,"commits":commits,"label_bright_pixels":label_bright_pixels,"empty_pixel":empty_pixel,"backdrop_pixel":theme::colorref(underneath),"empty_pixel_matches_desktop":transparent,"empty_region_receives_input":empty_region_receives_input,"rounded_corner_intact":rounded_corner_intact});
         std::fs::write(
             directory.join("gpu-animation.json"),
             serde_json::to_vec_pretty(&record)?,
@@ -687,6 +720,64 @@ pub unsafe fn smoke(directory: &std::path::Path) -> Result<()> {
             empty_region_receives_input,
             "Transparent region lost mouse input"
         );
+        let mut bare = spec.clone();
+        bare.text.clear();
+        bare.trailing.clear();
+        bare.previous = None;
+        bare.previous_trailing.clear();
+        bare.progress = Some(0.);
+        composition.sync(vec![bare.clone()])?;
+        composition.device.WaitForCommitCompletion()?;
+        DwmFlush();
+        let empty = capture("gpu-empty.bmp")?;
+        let mut cases = vec![];
+        for progress in [0.01, 0.05, 1.0] {
+            bare.progress = Some(progress);
+            composition.sync(vec![bare.clone()])?;
+            composition.device.WaitForCommitCompletion()?;
+            DwmFlush();
+            let actual = capture(&format!("gpu-fill-{}.bmp", (progress * 100.) as u32))?;
+            let key = Key {
+                width: 240,
+                height: 32,
+                fill: (progress * FILL_SCALE as f64).round() as i32,
+                accent: bare.accent,
+            };
+            let bounds = fill_bounds(key).unwrap();
+            let mut checked = 0;
+            for y in 0..key.height {
+                for x in 0..key.width {
+                    let outside = distance(
+                        (x - bounds.left) as f64 + 0.5,
+                        (y - bounds.top) as f64 + 0.5,
+                        (key.width - 2 * bounds.left) as f64,
+                        bounds.height as f64,
+                    ) > 1.2;
+                    if outside {
+                        let i = ((8 + y) * 260 + 10 + x) as usize;
+                        let a = actual[i];
+                        let b = empty[i];
+                        let delta = [0, 8, 16]
+                            .iter()
+                            .map(|shift| {
+                                (((a >> shift) & 255) as i32 - ((b >> shift) & 255) as i32).abs()
+                            })
+                            .max()
+                            .unwrap();
+                        anyhow::ensure!(
+                            delta <= 3,
+                            "GPU fill leaked outside the fixed inner capsule at {progress}: {x},{y}"
+                        );
+                        checked += 1;
+                    }
+                }
+            }
+            cases.push(serde_json::json!({"progress":progress,"outside_pixels_checked":checked,"fixed_capsule_clip":true}));
+        }
+        std::fs::write(
+            directory.join("gpu-low-fill.json"),
+            serde_json::to_vec_pretty(&cases)?,
+        )?;
         Ok(())
     }
 }

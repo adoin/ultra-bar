@@ -1,4 +1,5 @@
 //! Bounded JSON-lines transport for API v3 resident plugins. Stdout is protocol only.
+pub mod editors;
 use serde::{Deserialize, Serialize};
 use std::io::{self, BufRead, Write};
 pub const MAX_LINE: usize = 64 * 1024;
@@ -10,8 +11,15 @@ pub enum HostEvent {
         id: String,
         data_dir: String,
         accent: String,
+        #[serde(default)]
+        host: usize,
     },
     Show,
+    Settings,
+    SettingsValues {
+        revision: u64,
+        values: Vec<String>,
+    },
     Foreground {
         executable: String,
         title: String,
@@ -25,6 +33,8 @@ pub enum HostEvent {
 pub struct Page {
     pub id: String,
     pub text: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub trailing: String,
     pub tooltip: String,
     /// Remaining fraction, not consumed fraction. None means unknown.
     pub progress: Option<f64>,
@@ -33,6 +43,9 @@ pub struct Page {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PluginEvent {
     Ready,
+    Capabilities {
+        settings: bool,
+    },
     Widget {
         pages: Vec<Page>,
     },
@@ -77,6 +90,7 @@ pub fn valid_pages(pages: &[Page]) -> bool {
     pages.len() <= 8
         && pages.iter().all(|p| {
             p.id.len() <= 128
+                && p.trailing.chars().count() <= 24
                 && p.text.chars().count() <= 80
                 && p.tooltip.chars().count() <= 1024
                 && p.progress
@@ -88,6 +102,10 @@ mod tests {
     use super::*;
     #[test]
     fn bounded_input_and_unknown_quota() {
+        let legacy: Page =
+            serde_json::from_str(r#"{"id":"a","text":"old","tooltip":"","progress":null}"#)
+                .unwrap();
+        assert!(legacy.trailing.is_empty());
         assert!(read_line(&mut io::Cursor::new(vec![b'x'; MAX_LINE + 1])).is_err());
         let p = Page {
             text: "Claude —".into(),

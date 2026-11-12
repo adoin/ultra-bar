@@ -164,8 +164,12 @@ pub unsafe fn edit(owner: HWND, title: &str, hint: &str, initial: &str) -> Optio
                 null(),
             );
             SendMessageW(child, WM_SETFONT, font as _, 1);
+            if class == "STATIC" || class == "BUTTON" {
+                ultra_bar_native_ui::input::attach_label(child);
+            }
             if id == 10 {
                 state.edit = child;
+                ultra_bar_native_ui::input::attach(child);
                 SendMessageW(child, EM_SETLIMITTEXT, 256, 0);
                 let margin = unit(8) as u32;
                 SendMessageW(
@@ -228,10 +232,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
             return 0;
         }
         if message == WM_ERASEBKGND {
-            let mut rect: RECT = zeroed();
-            GetClientRect(hwnd, &mut rect);
-            FillRect(w as HDC, &rect, background());
             return 1;
+        }
+        if message == WM_PAINT {
+            let mut ps: PAINTSTRUCT = zeroed();
+            let dc = BeginPaint(hwnd, &mut ps);
+            let mut area: RECT = zeroed();
+            GetClientRect(hwnd, &mut area);
+            if let Some(surface) = ultra_bar_native_ui::Surface::new(area.right, area.bottom) {
+                FillRect(
+                    surface.dc,
+                    &area,
+                    ultra_bar_native_ui::theme::background_brush(),
+                );
+                surface.blit_opaque(dc);
+            }
+            EndPaint(hwnd, &ps);
+            return 0;
         }
         if message == WM_NCCREATE {
             SetWindowLongPtrW(

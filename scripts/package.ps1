@@ -55,7 +55,7 @@ foreach ($package in ($full.packages | Sort-Object name,version)) {
     [void]$notices.AppendLine("$($package.name) $($package.version) | $($package.license) | $($package.repository)")
     $directory = Split-Path -Parent $package.manifest_path
     $licenses = @(Get-ChildItem -LiteralPath $directory -File | Where-Object Name -Match '^(LICENSE|LICENCE|COPYING|NOTICE)(\.|-|$)')
-    if ($package.license_file) { $licenses += Get-Item -LiteralPath (Join-Path $directory $package.license_file) }
+    if ($package.license_file) { $licensePath = if ([IO.Path]::IsPathRooted($package.license_file)) { $package.license_file } else { Join-Path $directory $package.license_file }; $licenses += Get-Item -LiteralPath $licensePath }
     foreach ($license in ($licenses | Sort-Object FullName -Unique)) {
         [void]$notices.AppendLine("--- $($license.Name) ---")
         [void]$notices.AppendLine([IO.File]::ReadAllText($license.FullName))
@@ -76,3 +76,11 @@ $installer = Join-Path $OutputDirectory "$name.exe"
 "$((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant())  $name.exe" | Set-Content -LiteralPath "$installer.sha256" -Encoding ascii
 Copy-Item -LiteralPath "$stage/build-info.json" -Destination "$OutputDirectory/$name.build-info.json" -Force
 Write-Host "[package] $installer"
+
+if (-not $IsolationTest) {
+    $pdb = Join-Path $target 'release/ultra_bar.pdb'
+    if (-not (Test-Path -LiteralPath $pdb)) { throw 'Matching release symbols were not generated.' }
+    $symbols = Join-Path $OutputDirectory "UltraBar-$version-windows-x86_64-symbols.zip"
+    Compress-Archive -LiteralPath $pdb,"$stage/build-info.json" -DestinationPath $symbols -Force
+    "$((Get-FileHash -LiteralPath $symbols -Algorithm SHA256).Hash.ToLowerInvariant())  $([IO.Path]::GetFileName($symbols))" | Set-Content -LiteralPath "$symbols.sha256" -Encoding ascii
+}

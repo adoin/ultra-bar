@@ -345,6 +345,11 @@ fn load_all(root: &Path, old: Vec<Plugin>, prefer_development: bool) -> Vec<Plug
         }
     }
     eprintln!("[plugins] loaded {} plugin(s)", output.len());
+    ultra_bar_native_ui::diagnostics::event(
+        "plugins",
+        "loaded",
+        serde_json::json!({"plugins":output.iter().map(|p|serde_json::json!({"id":p.manifest.id,"version":p.manifest.version,"root":p.root})).collect::<Vec<_>>()}),
+    );
     output
 }
 

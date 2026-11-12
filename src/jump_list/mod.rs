@@ -29,9 +29,9 @@ impl Query {
         Self {
             hwnd,
             pid,
-            executable,
+            executable: executable.clone(),
             shortcut,
-            app_id: None,
+            app_id: executable.strip_prefix("appx:").map(str::to_owned),
             output: PathBuf::new(),
             prefix: String::new(),
         }
@@ -333,7 +333,7 @@ pub fn diagnose(directory: &Path, args: &[String]) -> Result<()> {
         value("--exe").cloned().unwrap_or_default(),
         value("--shortcut").cloned(),
     );
-    query.app_id = value("--appid").cloned();
+    query.app_id = value("--appid").cloned().or(query.app_id);
     let snapshot = read_isolated(query, directory, 1, &AtomicU64::new(1))?;
     let report = serde_json::json!({"app_id":snapshot.wire.app_id,"custom_supported":snapshot.wire.custom_supported,"items":snapshot.wire.entries.iter().map(|entry|serde_json::json!({"title":entry.title,"category":entry.category,"kind":entry.kind})).collect::<Vec<_>>()});
     crate::task_popup::preview_context(directory, &snapshot)?;

@@ -27,7 +27,9 @@ pub enum Target {
     CloseGroup(usize),
     CloseWindow { hwnd: usize, pid: u32 },
     ThisPc,
+    SettingsCommand(usize),
     Jump { generation: u64, index: usize },
+    Script { generation: u64, index: usize },
 }
 impl Target {
     fn close_available(self) -> Option<bool> {
@@ -44,7 +46,9 @@ impl Target {
             | Self::Launch(_)
             | Self::CloseGroup(_)
             | Self::Jump { .. }
+            | Self::Script { .. }
             | Self::ThisPc => true,
+            Self::SettingsCommand(_) => true,
             Self::Window { hwnd, pid } | Self::CloseWindow { hwnd, pid } => unsafe {
                 let mut current = 0;
                 IsWindow(hwnd as HWND) != 0
@@ -251,6 +255,33 @@ impl Popup {
                 0,
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
+        }
+    }
+    pub unsafe fn verify_script_scroll(
+        &mut self,
+        directory: &std::path::Path,
+        last: Target,
+    ) -> anyhow::Result<()> {
+        unsafe {
+            anyhow::ensure!(
+                self.state.rows <= 8 && self.state.items.len() > self.state.rows,
+                "脚本弹层未限制最大高度"
+            );
+            self.state.export = Some(directory.join("scripts-first.bmp"));
+            paint(&mut self.state);
+            SendMessageW(
+                self.state.hwnd,
+                WM_MOUSEWHEEL,
+                (-120i16 as u16 as usize) << 16,
+                0,
+            );
+            anyhow::ensure!(self.state.scroll > 0, "脚本列表无法滚动");
+            SendMessageW(self.state.hwnd, WM_KEYDOWN, VK_END as usize, 0);
+            self.state.export = Some(directory.join("scripts-last.bmp"));
+            paint(&mut self.state);
+            SendMessageW(self.state.hwnd, WM_KEYDOWN, VK_RETURN as usize, 0);
+            anyhow::ensure!(self.take_selection() == Some(last), "脚本列表末项无法选择");
+            Ok(())
         }
     }
     pub fn take_selection(&mut self) -> Option<Target> {
@@ -795,6 +826,24 @@ unsafe fn paint(state: &mut State) {
             });
         }
         SelectObject(dc, old);
+        if state.items.len() > state.rows {
+            let top = unit(state, 10);
+            let height = (area.bottom - unit(state, 20)).max(1);
+            let thumb_height = (height * state.rows as i32 / state.items.len() as i32)
+                .max(unit(state, 22))
+                .min(height);
+            let offset = (height - thumb_height) * state.scroll as i32
+                / (state.items.len() - state.rows) as i32;
+            rounded(
+                RECT {
+                    left: area.right - unit(state, 5),
+                    right: area.right - unit(state, 3),
+                    top: top + offset,
+                    bottom: top + offset + thumb_height,
+                },
+                p.muted,
+            );
+        }
         if let Some(path) = state.export.take() {
             let _ = surface.save_bmp(&path);
         }

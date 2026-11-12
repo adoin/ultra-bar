@@ -25,8 +25,14 @@ pub fn close_available(hwnd: HWND, pid: u32) -> Option<bool> {
 }
 pub fn request_close(hwnd: HWND, pid: u32) -> bool {
     unsafe {
-        close_available(hwnd, pid) == Some(true)
-            && PostMessageW(hwnd, WM_SYSCOMMAND, SC_CLOSE as usize, 0) != 0
+        let sent = close_available(hwnd, pid) == Some(true)
+            && PostMessageW(hwnd, WM_SYSCOMMAND, SC_CLOSE as usize, 0) != 0;
+        ultra_bar_native_ui::diagnostics::event(
+            "tasks",
+            "window.close_requested",
+            serde_json::json!({"hwnd":hwnd as usize,"pid":pid,"sent":sent}),
+        );
+        sent
     }
 }
 

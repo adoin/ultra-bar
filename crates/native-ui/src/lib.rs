@@ -8,12 +8,18 @@ use windows_sys::{
     Win32::{
         Foundation::*,
         Graphics::Gdi::*,
-        System::{LibraryLoader::*, Threading::*},
+        System::{Com::*, LibraryLoader::*, Threading::*},
         UI::{Controls::*, Shell::*, WindowsAndMessaging::*},
     },
     core::BOOL,
 };
+pub mod diagnostics;
+pub mod editor_bridge;
 pub mod form;
+pub mod input;
+pub mod packaged_icon;
+pub mod popover;
+pub mod settings_bridge;
 pub mod text;
 pub mod theme;
 
@@ -45,7 +51,50 @@ impl AppIcon {
     /// # Safety
     /// Call from a Windows UI thread; the returned icon owns its native handle.
     pub unsafe fn from_file(path: &str, dpi: i32, logical_size: i32) -> Self {
-        unsafe { Self::from_resource(path, 0, dpi, logical_size) }
+        unsafe {
+            if let Some(id) = path.strip_prefix("shell:AppsFolder\\") {
+                if let Some(handle) =
+                    packaged_icon::load(id, (logical_size * dpi / 96).max(1) as u32)
+                {
+                    return Self {
+                        original: 0,
+                        handle,
+                    };
+                }
+                let hr = CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
+                let mut pidl = null_mut();
+                let mut info: SHFILEINFOW = zeroed();
+                if SHParseDisplayName(wide(path).as_ptr(), null_mut(), &mut pidl, 0, null_mut())
+                    >= 0
+                    && !pidl.is_null()
+                {
+                    SHGetFileInfoW(
+                        pidl.cast(),
+                        0,
+                        &mut info,
+                        size_of::<SHFILEINFOW>() as u32,
+                        SHGFI_PIDL
+                            | SHGFI_ICON
+                            | if logical_size * dpi / 96 <= 16 {
+                                SHGFI_SMALLICON
+                            } else {
+                                SHGFI_LARGEICON
+                            },
+                    );
+                    CoTaskMemFree(pidl.cast());
+                }
+                if hr >= 0 {
+                    CoUninitialize();
+                }
+                if !info.hIcon.is_null() {
+                    return Self {
+                        original: 0,
+                        handle: info.hIcon,
+                    };
+                }
+            }
+            Self::from_resource(path, 0, dpi, logical_size)
+        }
     }
     /// # Safety
     /// Call from a Windows UI thread; the resource is extracted without link overlays.
@@ -91,6 +140,14 @@ impl AppIcon {
     /// Call from a Windows UI thread with a live window whose icon can be copied.
     pub unsafe fn read(hwnd: HWND, dpi: i32, logical_size: i32) -> Self {
         unsafe {
+            if let Some(handle) =
+                packaged_icon::for_window(hwnd, (logical_size * dpi / 96).max(1) as u32)
+            {
+                return Self {
+                    original: 0,
+                    handle,
+                };
+            }
             let mut original = 0;
             SendMessageTimeoutW(
                 hwnd,
@@ -279,6 +336,39 @@ pub struct Surface {
     foreground: Rc<RefCell<Vec<bool>>>,
 }
 impl Surface {
+    /// Blit a GDI-painted client to a constant-alpha layered window. GDI clears
+    /// DIB alpha during fills; leaving those zeros lets blur composition treat
+    /// the client as a transparent hole after the desktop underneath changes.
+    /// # Safety
+    /// Use only for GDI/constant-alpha clients, not per-pixel `present` windows.
+    pub unsafe fn blit_opaque(&self, target: HDC) {
+        unsafe {
+            GdiFlush();
+            for pixel in
+                std::slice::from_raw_parts_mut(self.pixels, (self.width * self.height) as usize)
+            {
+                *pixel |= 0xff000000;
+            }
+            AlphaBlend(
+                target,
+                0,
+                0,
+                self.width,
+                self.height,
+                self.dc,
+                0,
+                0,
+                self.width,
+                self.height,
+                BLENDFUNCTION {
+                    BlendOp: AC_SRC_OVER as u8,
+                    BlendFlags: 0,
+                    SourceConstantAlpha: 255,
+                    AlphaFormat: AC_SRC_ALPHA as u8,
+                },
+            );
+        }
+    }
     /// Clear only an antialiased rounded silhouette; leave its corners and surrounding padding intact.
     /// # Safety
     /// Call on the rendering thread before foreground paint.
@@ -733,14 +823,16 @@ impl Tooltips {
     }
     /// # Safety
     /// Call on the owner's UI thread while its window and tooltip are live.
-    pub unsafe fn sync(&mut self, tips: Vec<Tip>) {
+    pub unsafe fn sync(&mut self, mut tips: Vec<Tip>) {
+        tips.retain(|tip| !tip.text.trim().is_empty());
         if self.tips == tips {
             return;
         }
         unsafe {
-            for index in 0..self.tips.len() {
+            for index in tips.len()..self.tips.len() {
+                // V2 size also works without a Comctl32 v6 activation context (native plugins).
                 let info = TTTOOLINFOW {
-                    cbSize: size_of::<TTTOOLINFOW>() as _,
+                    cbSize: std::mem::offset_of!(TTTOOLINFOW, lpReserved) as _,
                     hwnd: self.owner,
                     uId: index + 1,
                     ..zeroed()
@@ -752,11 +844,20 @@ impl Tooltips {
                     (&info as *const TTTOOLINFOW) as _,
                 );
             }
-            self.strings = tips.iter().map(|tip| wide(&tip.text)).collect();
+            self.strings.truncate(tips.len());
+            self.strings.resize_with(tips.len(), Vec::new);
             for (index, tip) in tips.iter().enumerate() {
+                let previous = self.tips.get(index);
+                if previous == Some(tip) {
+                    continue;
+                }
+                let changed_text = previous.is_none_or(|old| old.text != tip.text);
+                // Retain the old allocation until the control has accepted its new pointer.
+                let _old = changed_text
+                    .then(|| std::mem::replace(&mut self.strings[index], wide(&tip.text)));
                 let (left, top, right, bottom) = tip.bounds;
                 let info = TTTOOLINFOW {
-                    cbSize: size_of::<TTTOOLINFOW>() as _,
+                    cbSize: std::mem::offset_of!(TTTOOLINFOW, lpReserved) as _,
                     hwnd: self.owner,
                     uId: index + 1,
                     uFlags: TTF_SUBCLASS | TTF_TRANSPARENT,
@@ -769,12 +870,31 @@ impl Tooltips {
                     lpszText: self.strings[index].as_mut_ptr(),
                     ..zeroed()
                 };
-                SendMessageW(
-                    self.window,
-                    TTM_ADDTOOLW,
-                    0,
-                    (&info as *const TTTOOLINFOW) as _,
-                );
+                if let Some(previous) = previous {
+                    if previous.bounds != tip.bounds {
+                        SendMessageW(
+                            self.window,
+                            TTM_NEWTOOLRECTW,
+                            0,
+                            (&info as *const TTTOOLINFOW) as _,
+                        );
+                    }
+                    if changed_text {
+                        SendMessageW(
+                            self.window,
+                            TTM_UPDATETIPTEXTW,
+                            0,
+                            (&info as *const TTTOOLINFOW) as _,
+                        );
+                    }
+                } else {
+                    SendMessageW(
+                        self.window,
+                        TTM_ADDTOOLW,
+                        0,
+                        (&info as *const TTTOOLINFOW) as _,
+                    );
+                }
             }
             self.tips = tips;
         }
@@ -784,6 +904,166 @@ impl Tooltips {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn constant_alpha_gdi_clients_keep_their_own_colors_on_black_and_white_backdrops() {
+        unsafe {
+            let source = Surface::new(16, 12).unwrap();
+            let target = Surface::new(16, 12).unwrap();
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: 16,
+                bottom: 12,
+            };
+            let brush = CreateSolidBrush(0x00352a21);
+            FillRect(source.dc, &rect, brush);
+            DeleteObject(brush);
+            let inner = RECT {
+                left: 3,
+                top: 3,
+                right: 12,
+                bottom: 9,
+            };
+            FillRect(source.dc, &inner, GetStockObject(WHITE_BRUSH));
+            let before = source.copy_pixels();
+            for backdrop in [BLACK_BRUSH, WHITE_BRUSH] {
+                FillRect(target.dc, &rect, GetStockObject(backdrop));
+                source.blit_opaque(target.dc);
+                let pixels = target.copy_pixels();
+                assert!(pixels.iter().all(|p| p >> 24 == 255));
+                for (p, original) in pixels.iter().zip(&before) {
+                    assert_eq!(p & 0xffffff, original & 0xffffff);
+                }
+            }
+        }
+    }
+    #[test]
+    fn whitespace_only_tooltips_do_not_create_a_narrow_empty_popup() {
+        unsafe {
+            let owner = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_POPUP,
+                -32000,
+                -32000,
+                100,
+                40,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            let mut tips = Tooltips::new(owner);
+            tips.sync(vec![
+                Tip {
+                    bounds: (0, 0, 20, 20),
+                    text: "\n \t\n".into(),
+                },
+                Tip {
+                    bounds: (20, 0, 60, 20),
+                    text: "2026-11-11 星期三".into(),
+                },
+            ]);
+            assert_eq!(SendMessageW(tips.window, TTM_GETTOOLCOUNT, 0, 0), 1);
+            DestroyWindow(owner);
+        }
+    }
+    #[test]
+    fn changing_a_live_tooltip_does_not_delete_its_active_tool() {
+        unsafe {
+            let owner = CreateWindowExW(
+                0,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_POPUP,
+                -32000,
+                -32000,
+                100,
+                50,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!owner.is_null());
+            let mut tips = Tooltips::new(owner);
+            tips.sync(vec![Tip {
+                bounds: (0, 0, 32, 32),
+                text: "下载速度：0 B/s\n上传速度：0 B/s".into(),
+            }]);
+            let tool = TTTOOLINFOW {
+                cbSize: std::mem::offset_of!(TTTOOLINFOW, lpReserved) as _,
+                hwnd: owner,
+                uId: 1,
+                uFlags: TTF_TRACK | TTF_ABSOLUTE,
+                rect: RECT {
+                    left: 0,
+                    top: 0,
+                    right: 32,
+                    bottom: 32,
+                },
+                lpszText: tips.strings[0].as_mut_ptr(),
+                ..zeroed()
+            };
+            SendMessageW(
+                tips.window,
+                TTM_SETTOOLINFOW,
+                0,
+                (&tool as *const TTTOOLINFOW) as _,
+            );
+            SendMessageW(
+                tips.window,
+                TTM_TRACKACTIVATE,
+                1,
+                (&tool as *const TTTOOLINFOW) as _,
+            );
+            let mut active: TTTOOLINFOW = zeroed();
+            active.cbSize = std::mem::offset_of!(TTTOOLINFOW, lpReserved) as _;
+            assert_ne!(
+                SendMessageW(
+                    tips.window,
+                    TTM_GETCURRENTTOOLW,
+                    0,
+                    (&mut active as *mut TTTOOLINFOW) as _
+                ),
+                0
+            );
+            tips.sync(vec![Tip {
+                bounds: (0, 0, 32, 32),
+                text: "下载速度：3 MB/s\n上传速度：12 KB/s".into(),
+            }]);
+            assert_ne!(
+                SendMessageW(
+                    tips.window,
+                    TTM_GETCURRENTTOOLW,
+                    0,
+                    (&mut active as *mut TTTOOLINFOW) as _
+                ),
+                0
+            );
+            assert_eq!(active.uId, 1);
+            assert_eq!(SendMessageW(tips.window, TTM_GETTOOLCOUNT, 0, 0), 1);
+            let mut text = [0u16; 512];
+            let info = TTTOOLINFOW {
+                cbSize: std::mem::offset_of!(TTTOOLINFOW, lpReserved) as _,
+                hwnd: owner,
+                uId: 1,
+                lpszText: text.as_mut_ptr(),
+                ..zeroed()
+            };
+            SendMessageW(
+                tips.window,
+                TTM_GETTEXTW,
+                text.len(),
+                (&info as *const TTTOOLINFOW) as _,
+            );
+            assert!(
+                String::from_utf16_lossy(&text).starts_with("下载速度：3 MB/s\n上传速度：12 KB/s")
+            );
+            DestroyWindow(owner);
+        }
+    }
     #[test]
     fn overlay_can_cover_an_icon_and_is_protected_from_later_background_shadows() {
         unsafe {

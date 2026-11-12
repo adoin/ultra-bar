@@ -1,5 +1,15 @@
 # API v3 后台插件
 
+## 插件设置
+
+任务栏空白处右键显示毛玻璃菜单，选择“设置”打开独立设置窗口。各插件按稳定 ID 追加到左侧导航，右侧直接编辑文本、选项、密码或链接；“插件”页保留插件中心。切换页面保留各自草稿，保存和重新载入位于右下角。未保存或保存中的草稿会阻止开发环境自动重启主程序。
+
+SDK 面板调用 `Panel::settings(fields)` 发布有界 `settings-schema.json`，并用注册消息通知宿主，宿主只在打开设置或收到通知时读取，不添加文件扫描轮询。密码字段写快照前清空。能力声明仍为 `{"type":"capabilities","settings":true}`；独立面板齿轮入口继续兼容 `{"type":"settings"}`。内嵌保存走 `{"type":"settings_values","revision":123,"values":[...]}`，后端接收命令后先调用 `panel.settings_command(command)`，再校验 `Command::SettingsSaved`、持久化并调用 `panel.settings(fields)` 确认；错误调用 `panel.settings_error(message)`。宿主用快照中的 `ack` 匹配原请求，插件重启或其他配置窗口更新不会被误认成保存成功。无效内容留在原页面提示，保留草稿。
+
+`.validated(fn)` 保护插件自己的弹窗；内嵌表单不会跨进程执行函数指针，后端必须在保存处理里验证输入。schema 最多 32 个字段、64 KiB，设置命令同样受 64 KiB JSON-lines 上限约束。
+
+API v2 日历发布同一声明格式；内嵌保存使用当前实例的有界 WM_COPYDATA 请求，只在事件中处理，不建立常驻查询。API Key 仅在内存消息中传递，最终仍由插件写入凭据库。存在未保存编辑器时拒绝应用并在右侧提示。原 `UltraBar.Plugin.Settings.v1` 独立入口保留兼容。
+
 API v1 Rune 插件、API v2 日历面板继续沿用原协议。v3 在 Rune 入口之外增加宿主管理的原生服务，新增 `leading`（开始按钮之后）和 `tray`（原生托盘之前）槽位；宽度范围 16–320。时钟槽仍使用既有机制。
 
 ```json
@@ -35,8 +45,8 @@ API v1 Rune 插件、API v2 日历面板继续沿用原协议。v3 在 Rune 入�
 服务发送：
 
 - `ready`：完成初始化。
-- `widget {pages:[{id,text,tooltip,progress}]}`：最多 8 页，文字 80 字符、提示 1024 字符。`progress` 为 0–1 的剩余比例，未知用 null；空页数组隐藏 tray 槽位。多页每 5 秒切换，只有 180ms 过渡期间启动短时绘制计时器。
-- `open {path,select_parent}`：仅声明 `shell.open` 的服务可请求。路径必须为绝对本地文件路径，宿主执行 Shell 打开或 Explorer 定位。操作通过脱离插件和开发 Job 的宿主 helper 执行，插件退出不会关闭用户刚打开的程序。
+- `widget {pages:[{id,text,trailing,tooltip,progress}]}`：最多 8 页，文字 80 字符、提示 1024 字符；可选 `trailing` 最多24字符，独立右对齐，省略时兼容原客户端。`progress` 为 0–1 的剩余比例，未知用 null；空页数组隐藏 tray 槽位。多页每 5 秒切换，只有 180ms 过渡期间启动短时绘制计时器。
+- `open {path,select_parent}`：仅声明 `shell.open` 的服务可请求。路径接受绝对本地文件路径，或 `shell:AppsFolder\<包族名>!<应用ID>` 形式的打包应用入口；宿主执行 Shell 打开或 Explorer 定位，不接受其他 Shell 命名空间。操作通过脱离插件和开发 Job 的宿主 helper 执行，插件退出不会关闭用户刚打开的程序。
 
 此阶段后台服务不获得系统服务安装、任意 Shell 命令或索引扫描接口。Everything 插件使用既有客户端的官方 IPC；如以后需要额外数据源，其常驻职责也放在独立服务进程内，并明确其轮询／事件订阅和资源预算。
 
@@ -51,3 +61,11 @@ API v2 的后台 clock 面板可向启动环境 `ULTRA_BAR_CLOCK_STATE` 指定�
 摘要字段：`version: 1`、`display: 0|1|2`（时间／并排／六秒轮播）、`lunar`、`weather`、`tooltip`、`utc_offset_seconds`、`updated`（Unix 秒）。天气字符串不超过80字符，农历40字符，提示1024字符，JSON不超过16 KiB；严禁放 API Key、账户或日程正文。`updated` 超过三分钟后宿主回退系统时间。偏移用于用户已有时间格式，包含秒的格式仍按当前系统时刻计算，不冻结在发布时刻。
 
 面板负责天气网络缓存和凭据；宿主只订阅目录事件并在既有计时中处理摘要，不增加网络轮询或持续绘制。时钟后台进程保存草稿的生命周期仍遵循 API v2，不能作为无状态 API v3 服务直接强制替换。
+
+嵌套 CPU 配额按父 Job 预算计算。宿主检测已有父级配额并换算插件合计与单插件的相对比例，例如开发入口20%时插件总 Job 为父级的50%，单插件为总 Job的50%，最终仍是10%合计、5%单插件；不会把20%、10%、5%再次直接叠乘。参考 [Windows Job CPU 规则](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_cpu_rate_control_information)。
+
+`plugin-ui::statistics` 提供原生分层 tabs、周期切换、项目／模型列表、逐日图和 Token 构成。统计消息只在插件自己的进程内传递，不把日志或完整统计集挤入宿主的64 KiB协议；宿主只接收胶囊摘要。统计视图没有持续绘制循环。
+
+原生插件 UI 的 Show 请求在窗口层作为 toggle 处理，只有实际展开时才转交后端刷新；收起与点击外部仅隐藏窗口，服务继续运行。Popover 通过正常失焦消息关闭，不安装全局鼠标钩子，模态设置／日程编辑期间不隐藏禁用的父窗口。API v2 日历同样使用这一行为。
+
+编辑能力统一使用[宿主编辑器服务](plugin-editors.md)。日程编辑、搜索输入、插件设置和文件选择由主程序提供；插件 UI 进程保留展示与业务逻辑，不创建可编辑原生控件。
