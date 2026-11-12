@@ -202,8 +202,8 @@ impl Drop for View {
             if IsWindow(self.hwnd) != 0 {
                 DestroyWindow(self.hwnd);
             }
-            DeleteObject(self.font);
-            DeleteObject(self.icons);
+            ultra_bar_native_ui::fonts::delete_object(self.font);
+            ultra_bar_native_ui::fonts::delete_object(self.icons);
         }
     }
 }
@@ -754,7 +754,7 @@ unsafe fn create(
             ..zeroed()
         });
         let make_font = |name: &str, size: i32| {
-            CreateFontW(
+            ultra_bar_native_ui::fonts::create_font(
                 -u(size),
                 0,
                 0,
@@ -1057,7 +1057,7 @@ unsafe fn create(
                         SetWindowSubclass(h, Some(hotkey_keys), 0x554249, 0);
                     }
                     if matches!(f.kind, Kind::Code | Kind::Json) {
-                        let font = CreateFontW(
+                        let font = ultra_bar_native_ui::fonts::create_font(
                             -u(14),
                             0,
                             0,
@@ -1135,7 +1135,7 @@ unsafe fn create(
                             uFlags: TTF_IDISHWND | TTF_SUBCLASS,
                             hwnd,
                             uId: h as usize,
-                            lpszText: windows_sys::core::w!("跳过，保留原名").cast_mut(),
+                            lpszText: windows_sys::core::w!("取消，保留原值").cast_mut(),
                             ..zeroed()
                         };
                         SendMessageW(tip, TTM_ADDTOOLW, 0, (&info as *const TTTOOLINFOW) as isize);
@@ -1342,7 +1342,7 @@ unsafe extern "system" fn release_font(
         if m == WM_NCDESTROY {
             let font = RemovePropW(hwnd, wide("UltraBar.HostEditor.Font").as_ptr());
             if !font.is_null() {
-                DeleteObject(font);
+                ultra_bar_native_ui::fonts::delete_object(font);
             }
             RemoveWindowSubclass(hwnd, Some(release_font), id);
         }
@@ -1502,7 +1502,18 @@ unsafe fn layout(view: &mut View) {
                             if multiline { 64 } else { 28 },
                         )
                     };
-                    MoveWindow(*input, u(px), u(py), u(pw), u(ph), 1);
+                    MoveWindow(
+                        *input,
+                        u(px),
+                        u(py),
+                        u(pw),
+                        u(ph + if b.field.kind == Kind::Select {
+                            24 * 8
+                        } else {
+                            0
+                        }),
+                        1,
+                    );
                     EnableWindow(
                         *input,
                         i32::from(
@@ -2028,6 +2039,35 @@ pub unsafe fn smoke(directory: &std::path::Path, schema: Option<&std::path::Path
             let mut area: RECT = zeroed();
             GetClientRect(view.hwnd, &mut area);
             let surface = Surface::new(area.right, area.bottom).context("无法捕获编辑器")?;
+            if let Some(combo) = view
+                .bindings
+                .iter()
+                .find(|b| b.field.kind == Kind::Select)
+                .map(|b| b.inputs[0])
+            {
+                for _ in 0..3 {
+                    SendMessageW(combo, CB_SHOWDROPDOWN, 1, 0);
+                    pump_test_events();
+                    let mut info: COMBOBOXINFO = zeroed();
+                    info.cbSize = size_of::<COMBOBOXINFO>() as u32;
+                    ensure!(
+                        GetComboBoxInfo(combo, &mut info) != 0
+                            && IsWindowVisible(info.hwndList) != 0,
+                        "下拉框没有展开"
+                    );
+                    let mut bounds: RECT = zeroed();
+                    GetWindowRect(info.hwndList, &mut bounds);
+                    ensure!(
+                        bounds.bottom - bounds.top >= 48 * view.dpi / 96,
+                        "下拉列表被压缩成输入框高度"
+                    );
+                    SendMessageW(combo, CB_SHOWDROPDOWN, 0, 0);
+                }
+                std::fs::write(
+                    directory.join("dropdown-result.json"),
+                    b"{\"opened_repeatedly\":true,\"height_reserved\":true}",
+                )?;
+            }
             let _ = PrintWindow(view.hwnd, surface.dc, 0);
             paint(view, surface.dc);
             let mut root = POINT { x: 0, y: 0 };
@@ -2109,6 +2149,49 @@ pub unsafe fn smoke(directory: &std::path::Path, schema: Option<&std::path::Path
                 SendMessageW(title, EM_CANUNDO, 0, 0) != 0,
                 "业务校验破坏了撤销历史"
             );
+            let fonts = crate::visual::fonts::installed();
+            let family = ["Arial", "Microsoft YaHei", "Calibri"]
+                .into_iter()
+                .find(|f| fonts.iter().any(|n| n == f))
+                .unwrap_or("Segoe UI");
+            let font_path = directory.join("font-settings.json");
+            std::fs::write(
+                &font_path,
+                serde_json::to_vec(&serde_json::json!({"font_family":family}))?,
+            )?;
+            crate::visual::fonts::configure(font_path, family);
+            SendMessageW(hwnd, crate::visual::fonts::message(), 0, 0);
+            ensure!(
+                text(title) == "宿主编辑验证" && IsWindow(hwnd) != 0,
+                "切换字体丢失了草稿"
+            );
+            let mut actual: LOGFONTW = zeroed();
+            GetObjectW(
+                SendMessageW(title, WM_GETFONT, 0, 0) as _,
+                size_of::<LOGFONTW>() as i32,
+                (&mut actual as *mut LOGFONTW).cast(),
+            );
+            let n = actual.lfFaceName.iter().position(|v| *v == 0).unwrap_or(32);
+            ensure!(
+                String::from_utf16_lossy(&actual.lfFaceName[..n]) == family,
+                "编辑控件没有采用默认字体"
+            );
+            GetObjectW(
+                SendMessageW(GetDlgItem(hwnd, 9001), WM_GETFONT, 0, 0) as _,
+                size_of::<LOGFONTW>() as i32,
+                (&mut actual as *mut LOGFONTW).cast(),
+            );
+            let n = actual.lfFaceName.iter().position(|v| *v == 0).unwrap_or(32);
+            ensure!(
+                String::from_utf16_lossy(&actual.lfFaceName[..n]).contains("Assets"),
+                "字体设置覆盖了图标字形"
+            );
+            std::fs::write(
+                directory.join("font-result.json"),
+                serde_json::to_vec_pretty(
+                    &serde_json::json!({"installed_families":fonts.len(),"family":family,"draft_preserved":true,"icons_preserved":true}),
+                )?,
+            )?;
             std::fs::write(
                 directory.join("host-editor-result.json"),
                 serde_json::to_vec_pretty(

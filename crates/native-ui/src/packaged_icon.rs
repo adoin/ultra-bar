@@ -267,7 +267,7 @@ unsafe fn decode(path: &Path, pixels: u32) -> Option<HICON> {
             mask_data.as_ptr().cast(),
         );
         if mask.is_null() {
-            DeleteObject(color);
+            crate::fonts::delete_object(color);
             return None;
         }
         let icon = CreateIconIndirect(&ICONINFO {
@@ -277,8 +277,8 @@ unsafe fn decode(path: &Path, pixels: u32) -> Option<HICON> {
             hbmMask: mask,
             hbmColor: color,
         });
-        DeleteObject(mask);
-        DeleteObject(color);
+        crate::fonts::delete_object(mask);
+        crate::fonts::delete_object(color);
         (!icon.is_null()).then_some(icon)
     }
 }

@@ -188,6 +188,17 @@ pub fn changed_message() -> u32 {
 /// Invoke on the window's UI thread. The message carries a 24-bit RGB accent.
 pub unsafe fn handle_message(hwnd: HWND, message: u32, value: usize) -> bool {
     unsafe {
+        if message == crate::fonts::message() {
+            crate::fonts::reload();
+            crate::fonts::refresh_thread();
+            RedrawWindow(
+                hwnd,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN,
+            );
+            return true;
+        }
         if message != changed_message() {
             return false;
         }
@@ -216,7 +227,7 @@ struct Brush {
 impl Drop for Brush {
     fn drop(&mut self) {
         unsafe {
-            DeleteObject(self.handle as HGDIOBJ);
+            crate::fonts::delete_object(self.handle as HGDIOBJ);
         }
     }
 }

@@ -600,7 +600,7 @@ pub unsafe fn smoke(directory: &std::path::Path) -> Result<()> {
         };
         let brush = CreateSolidBrush(theme::palette().background);
         FillRect(background.dc, &area, brush);
-        DeleteObject(brush);
+        ultra_bar_native_ui::fonts::delete_object(brush);
         background.clear_rounded(
             &RECT {
                 left: 10,

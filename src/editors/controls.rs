@@ -390,7 +390,7 @@ pub(super) unsafe fn draw_combo_item(item: &DRAWITEMSTRUCT) {
         };
         FillRect(item.hDC, &r, brush);
         if item.itemState & ODS_SELECTED != 0 {
-            DeleteObject(brush);
+            ultra_bar_native_ui::fonts::delete_object(brush);
         }
         if item.itemID == u32::MAX {
             return;
@@ -531,7 +531,11 @@ pub(super) unsafe fn create(
             unit(x),
             unit(y),
             unit(width),
-            unit(height),
+            unit(if class == "COMBOBOX" {
+                height + 24 * 8
+            } else {
+                height
+            }),
             parent,
             id as _,
             GetModuleHandleW(null()),
@@ -581,8 +585,11 @@ pub(super) unsafe fn create(
         if class == "COMBOBOX" {
             SetWindowSubclass(child, Some(combo_proc), 1, dpi as _);
             SendMessageW(child, CB_SETITEMHEIGHT, 0, unit(24) as _);
+            SendMessageW(child, CB_SETITEMHEIGHT, usize::MAX, unit(24) as _);
+            SendMessageW(child, CB_SETMINVISIBLE, 8, 0);
         }
         if class == "SysDateTimePick32" {
+            SendMessageW(child, DTM_SETMCFONT, font as usize, 0);
             SetWindowSubclass(child, Some(date_proc), 1, dpi as _);
             attach_date_input(child, font, dpi);
         }
@@ -659,7 +666,7 @@ pub(super) unsafe fn paint_control(hwnd: HWND, dc: HDC, dpi: i32, kind: u8) {
                 },
             );
             FillRect(dc, &box_rect, brush);
-            DeleteObject(brush);
+            ultra_bar_native_ui::fonts::delete_object(brush);
             if SendMessageW(hwnd, BM_GETCHECK, 0, 0) == BST_CHECKED as isize {
                 let pen = CreatePen(
                     PS_SOLID,
@@ -671,7 +678,7 @@ pub(super) unsafe fn paint_control(hwnd: HWND, dc: HDC, dpi: i32, kind: u8) {
                 LineTo(dc, unit(7), top + unit(11));
                 LineTo(dc, unit(13), top + unit(4));
                 SelectObject(dc, old);
-                DeleteObject(pen);
+                ultra_bar_native_ui::fonts::delete_object(pen);
             }
             text_rect.left = unit(24);
             DrawTextW(
@@ -696,7 +703,7 @@ pub(super) unsafe fn paint_control(hwnd: HWND, dc: HDC, dpi: i32, kind: u8) {
             let old_pen = SelectObject(dc, pen);
             RoundRect(dc, 0, 0, rect.right, rect.bottom, unit(10), unit(10));
             SelectObject(dc, old_pen);
-            DeleteObject(pen);
+            ultra_bar_native_ui::fonts::delete_object(pen);
             SelectObject(dc, old_brush);
             let value = if kind == 2 {
                 let mut time: SYSTEMTIME = zeroed();
@@ -744,7 +751,7 @@ pub(super) unsafe fn paint_control(hwnd: HWND, dc: HDC, dpi: i32, kind: u8) {
                 Polygon(dc, points.as_ptr(), 3);
                 SelectObject(dc, old_pen);
                 SelectObject(dc, old_brush);
-                DeleteObject(brush);
+                ultra_bar_native_ui::fonts::delete_object(brush);
             }
         }
         if GetFocus() == hwnd {

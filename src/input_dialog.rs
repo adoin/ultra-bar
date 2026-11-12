@@ -43,7 +43,7 @@ pub unsafe fn edit(owner: HWND, title: &str, hint: &str, initial: &str) -> Optio
             edit: null_mut(),
             value: None,
             done: Cell::new(false),
-            icons: CreateFontW(
+            icons: ultra_bar_native_ui::fonts::create_font(
                 -19 * dpi / 96,
                 0,
                 0,
@@ -90,7 +90,7 @@ pub unsafe fn edit(owner: HWND, title: &str, hint: &str, initial: &str) -> Optio
             (&mut *state as *mut Input).cast(),
         );
         if window.is_null() {
-            DeleteObject(state.icons);
+            ultra_bar_native_ui::fonts::delete_object(state.icons);
             return None;
         }
         crate::visual::enable_glass(window);
@@ -196,6 +196,7 @@ pub unsafe fn edit(owner: HWND, title: &str, hint: &str, initial: &str) -> Optio
                 SendMessageW(tips, TTM_ADDTOOLW, 0, (&info as *const TTTOOLINFOW) as _);
             }
         }
+        ultra_bar_native_ui::fonts::refresh_tree(window);
         EnableWindow(owner, 0);
         ShowWindow(window, SW_SHOW);
         SetForegroundWindow(window);
@@ -222,7 +223,7 @@ pub unsafe fn edit(owner: HWND, title: &str, hint: &str, initial: &str) -> Optio
         }
         EnableWindow(owner, 1);
         SetForegroundWindow(owner);
-        DeleteObject(state.icons);
+        ultra_bar_native_ui::fonts::delete_object(state.icons);
         state.value.take()
     }
 }
@@ -305,7 +306,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 );
                 SelectObject(dc, old_pen);
                 SelectObject(dc, old_brush);
-                DeleteObject(brush);
+                ultra_bar_native_ui::fonts::delete_object(brush);
                 SetTextColor(dc, crate::visual::theme::palette().text);
                 SetBkMode(dc, TRANSPARENT as _);
                 let mut rect = item.rcItem;

@@ -189,7 +189,7 @@ pub fn run(
             GetDpiForWindow(owner).max(96) as i32
         };
         let font = |name: &str, height: i32| {
-            CreateFontW(
+            ultra_bar_native_ui::fonts::create_font(
                 -height * dpi / 96,
                 0,
                 0,
@@ -337,9 +337,9 @@ pub fn run(
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
-        DeleteObject(state.font);
-        DeleteObject(state.icons);
-        DeleteObject(state.brush);
+        ultra_bar_native_ui::fonts::delete_object(state.font);
+        ultra_bar_native_ui::fonts::delete_object(state.icons);
+        ultra_bar_native_ui::fonts::delete_object(state.brush);
     }
     Ok(())
 }
@@ -695,7 +695,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                 0
             }
             m if m == WM_APP + 3 => {
-                DeleteObject(s.brush);
+                ultra_bar_native_ui::fonts::delete_object(s.brush);
                 s.brush = CreateSolidBrush(theme::palette().field);
                 InvalidateRect(hwnd, null(), 1);
                 0
@@ -848,7 +848,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                     let palette = theme::palette();
                     let brush = CreateSolidBrush(palette.background);
                     FillRect(dc, &area, brush);
-                    DeleteObject(brush);
+                    ultra_bar_native_ui::fonts::delete_object(brush);
                     SelectObject(dc, s.font);
                     SetBkMode(dc, TRANSPARENT as _);
                     let text = |value: &str, x, y, width, height, color| {
@@ -902,7 +902,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                             );
                             SelectObject(dc, old);
                             SelectObject(dc, pen);
-                            DeleteObject(brush);
+                            ultra_bar_native_ui::fonts::delete_object(brush);
                         }
                         text(&row.title, 22, y + 3, 360, 26, palette.text);
                         text(&row.detail, 22, y + 29, 360, 23, palette.muted);

@@ -139,8 +139,8 @@ impl Drop for Popup {
             if IsWindow(self.state.hwnd) != 0 {
                 DestroyWindow(self.state.hwnd);
             }
-            DeleteObject(self.state.font);
-            DeleteObject(self.state.icons);
+            ultra_bar_native_ui::fonts::delete_object(self.state.font);
+            ultra_bar_native_ui::fonts::delete_object(self.state.icons);
         }
     }
 }
@@ -168,7 +168,7 @@ impl Popup {
                 ..zeroed()
             });
             let font = |family: &str, size: i32| {
-                CreateFontW(
+                ultra_bar_native_ui::fonts::create_font(
                     -size * dpi / 96,
                     0,
                     0,
@@ -225,8 +225,8 @@ impl Popup {
                 (&mut *state as *mut State).cast(),
             );
             if hwnd.is_null() {
-                DeleteObject(state.font);
-                DeleteObject(state.icons);
+                ultra_bar_native_ui::fonts::delete_object(state.font);
+                ultra_bar_native_ui::fonts::delete_object(state.icons);
                 return None;
             }
             state.hwnd = hwnd;
@@ -691,7 +691,7 @@ unsafe fn paint(state: &mut State) {
         let p = theme::palette();
         let background = CreateSolidBrush(p.background);
         FillRect(dc, &area, background);
-        DeleteObject(background);
+        ultra_bar_native_ui::fonts::delete_object(background);
         SetBkMode(dc, TRANSPARENT as i32);
         let old = SelectObject(dc, state.font);
         let rounded = |rect: RECT, color: u32| {
@@ -710,8 +710,8 @@ unsafe fn paint(state: &mut State) {
             );
             SelectObject(dc, old_pen);
             SelectObject(dc, old_brush);
-            DeleteObject(pen);
-            DeleteObject(brush);
+            ultra_bar_native_ui::fonts::delete_object(pen);
+            ultra_bar_native_ui::fonts::delete_object(brush);
         };
         let text = |value: &str, mut rect: RECT, color: u32, flags: u32| {
             SetTextColor(dc, color);
@@ -748,7 +748,7 @@ unsafe fn paint(state: &mut State) {
                     bottom: rect.top - unit(state, 2),
                 };
                 FillRect(dc, &line, brush);
-                DeleteObject(brush);
+                ultra_bar_native_ui::fonts::delete_object(brush);
             }
             if item.active {
                 rounded(rect, p.active_fill);

@@ -37,8 +37,8 @@ impl Drop for Picker {
             if IsWindow(self.hwnd) != 0 {
                 DestroyWindow(self.hwnd);
             }
-            DeleteObject(self.font);
-            DeleteObject(self.icons);
+            ultra_bar_native_ui::fonts::delete_object(self.font);
+            ultra_bar_native_ui::fonts::delete_object(self.icons);
         }
     }
 }
@@ -71,7 +71,7 @@ unsafe fn create(owner: HWND, initial: u32) -> Option<Box<Picker>> {
         });
         let dpi = GetDpiForWindow(owner).max(96) as i32;
         let font = |name: &str, size: i32| {
-            CreateFontW(
+            ultra_bar_native_ui::fonts::create_font(
                 -size * dpi / 96,
                 0,
                 0,
@@ -399,7 +399,7 @@ unsafe fn paint(state: &mut Picker) {
         let p = theme::palette();
         let brush = CreateSolidBrush(p.background);
         FillRect(dc, &area, brush);
-        DeleteObject(brush);
+        ultra_bar_native_ui::fonts::delete_object(brush);
         SetBkMode(dc, TRANSPARENT as i32);
         let old = SelectObject(dc, state.font);
         let text = |value: &str, mut rect: RECT, color: u32| {
@@ -449,7 +449,7 @@ unsafe fn paint(state: &mut Picker) {
             Ellipse(dc, x - radius, y - radius, x + radius + 1, y + radius + 1);
             SelectObject(dc, old_brush);
             SelectObject(dc, old_pen);
-            DeleteObject(pen);
+            ultra_bar_native_ui::fonts::delete_object(pen);
         };
         marker(
             plane.left + (state.selection.s * (plane.right - plane.left - 1) as f64) as i32,
@@ -476,7 +476,7 @@ unsafe fn paint(state: &mut Picker) {
             );
             SelectObject(dc, old_pen);
             SelectObject(dc, old_brush);
-            DeleteObject(brush);
+            ultra_bar_native_ui::fonts::delete_object(brush);
         };
         fill(state.rect(24, 294, 132, 28), p.field);
         fill(

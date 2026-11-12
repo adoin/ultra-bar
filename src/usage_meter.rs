@@ -437,8 +437,8 @@ pub unsafe fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
             };
             let brush = CreateSolidBrush(theme::palette().background);
             FillRect(surface.dc, &area, brush);
-            DeleteObject(brush);
-            let font = CreateFontW(
+            ultra_bar_native_ui::fonts::delete_object(brush);
+            let font = ultra_bar_native_ui::fonts::create_font(
                 -13,
                 0,
                 0,
@@ -482,7 +482,7 @@ pub unsafe fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
                 }
             }
             SelectObject(surface.dc, old);
-            DeleteObject(font);
+            ultra_bar_native_ui::fonts::delete_object(font);
             surface.save_bmp(&directory.join(format!("usage-bubbles-{name}.bmp")))?;
         }
         theme::set_accent(original);
@@ -495,7 +495,7 @@ mod tests {
     #[test]
     fn reset_suffix_is_not_ellipsized_and_the_double_shadow_works_on_light_and_dark() {
         unsafe {
-            let font = CreateFontW(
+            let font = ultra_bar_native_ui::fonts::create_font(
                 -12,
                 0,
                 0,
@@ -577,7 +577,7 @@ mod tests {
                     }
                 }
             }
-            DeleteObject(font);
+            ultra_bar_native_ui::fonts::delete_object(font);
             atlas
                 .save_bmp(std::path::Path::new(
                     "D:/tmp/ultra-bar-agent-dashboard-20261111/caption-contrast.bmp",

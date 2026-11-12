@@ -243,7 +243,7 @@ pub unsafe fn edit(owner: HWND, title: &str, fields: Vec<Field>) -> Option<Vec<S
             ..zeroed()
         });
         let font = |name: &str, h| {
-            CreateFontW(
+            crate::fonts::create_font(
                 -scale(h),
                 0,
                 0,
@@ -301,9 +301,9 @@ pub unsafe fn edit(owner: HWND, title: &str, fields: Vec<Field>) -> Option<Vec<S
             (&mut *s as *mut State).cast(),
         );
         if hwnd.is_null() {
-            DeleteObject(s.font);
-            DeleteObject(s.icons);
-            DeleteObject(s.brush);
+            crate::fonts::delete_object(s.font);
+            crate::fonts::delete_object(s.icons);
+            crate::fonts::delete_object(s.brush);
             return None;
         }
         let glass = enable_glass(hwnd);
@@ -422,9 +422,9 @@ pub unsafe fn edit(owner: HWND, title: &str, fields: Vec<Field>) -> Option<Vec<S
             EnableWindow(owner, 1);
             SetForegroundWindow(owner);
         }
-        DeleteObject(s.font);
-        DeleteObject(s.icons);
-        DeleteObject(s.brush);
+        crate::fonts::delete_object(s.font);
+        crate::fonts::delete_object(s.icons);
+        crate::fonts::delete_object(s.brush);
         if let Some(code) = quit {
             PostQuitMessage(code as i32);
         }
@@ -576,7 +576,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                     let p = theme::palette();
                     let brush = CreateSolidBrush(p.background);
                     FillRect(dc, &rect, brush);
-                    DeleteObject(brush);
+                    crate::fonts::delete_object(brush);
                     SelectObject(dc, s.font);
                     SetBkMode(dc, TRANSPARENT as _);
                     let text = |value: &str, x, y, width, height, color| {
@@ -617,7 +617,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                         );
                         SelectObject(dc, old);
                         SelectObject(dc, pen);
-                        DeleteObject(brush);
+                        crate::fonts::delete_object(brush);
                         if let Some(checked) = switch_state(f) {
                             text(&f.label, 25, y + 9, 360, 30, p.text);
                             draw_switch(
@@ -667,7 +667,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                             bottom: scale(y + thumb),
                         };
                         FillRect(dc, &r, brush);
-                        DeleteObject(brush);
+                        crate::fonts::delete_object(brush);
                     }
                     SelectObject(dc, s.icons);
                     text("\u{e711}", 448, 8, 25, 30, p.muted);

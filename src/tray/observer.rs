@@ -524,8 +524,8 @@ pub fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
                 hbmMask: mask,
                 hbmColor: bitmap,
             });
-            DeleteObject(bitmap);
-            DeleteObject(mask);
+            ultra_bar_native_ui::fonts::delete_object(bitmap);
+            ultra_bar_native_ui::fonts::delete_object(mask);
             ensure!(!icon.is_null(), "Cannot create tray fixture icon");
             Ok(Arc::new(Icon::owned(icon)))
         };

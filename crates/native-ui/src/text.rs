@@ -112,7 +112,10 @@ impl Renderer {
                 log.lfFaceName[..=length].to_vec()
             };
             let key = Font {
-                name,
+                name: crate::wide(&crate::fonts::resolve_font(
+                    GetCurrentObject(dc, OBJ_FONT as u32),
+                    &String::from_utf16_lossy(&name[..name.len().saturating_sub(1)]),
+                )),
                 size: log.lfHeight.abs().max(1),
                 weight: log.lfWeight,
                 italic: log.lfItalic != 0,
@@ -399,7 +402,7 @@ pub unsafe fn smoke(directory: &std::path::Path) -> std::io::Result<()> {
             SetTextColor(surface.dc, crate::theme::palette().text);
             let mut old: HGDIOBJ = std::ptr::null_mut();
             for (row, face, size) in [(0, "Segoe UI", 13), (1, "Segoe MDL2 Assets", 18)] {
-                let font = CreateFontW(
+                let font = crate::fonts::create_font(
                     -scale(size),
                     0,
                     0,
@@ -460,7 +463,7 @@ pub unsafe fn smoke(directory: &std::path::Path) -> std::io::Result<()> {
                     );
                 }
                 SelectObject(surface.dc, previous);
-                DeleteObject(font);
+                crate::fonts::delete_object(font);
             }
             SelectObject(surface.dc, old);
             surface.save_bmp(&directory.join(format!("text-aa-{dpi}.bmp")))?;

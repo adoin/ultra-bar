@@ -259,7 +259,7 @@ pub fn smoke(directory: &std::path::Path) -> std::io::Result<()> {
         });
     unsafe {
         for dpi in [96, 144] {
-            let font = CreateFontW(
+            let font = ultra_bar_native_ui::fonts::create_font(
                 -14 * dpi / 96,
                 0,
                 0,
@@ -275,7 +275,7 @@ pub fn smoke(directory: &std::path::Path) -> std::io::Result<()> {
                 0,
                 wide("Segoe UI").as_ptr(),
             );
-            let icons = CreateFontW(
+            let icons = ultra_bar_native_ui::fonts::create_font(
                 -18 * dpi / 96,
                 0,
                 0,
@@ -312,8 +312,8 @@ pub fn smoke(directory: &std::path::Path) -> std::io::Result<()> {
                     }
                 }
             }
-            DeleteObject(font);
-            DeleteObject(icons);
+            ultra_bar_native_ui::fonts::delete_object(font);
+            ultra_bar_native_ui::fonts::delete_object(icons);
         }
     }
     Ok(())
@@ -433,7 +433,7 @@ impl View {
                 &vec![0xee000000 | bg; (bounds.right * bounds.bottom) as usize],
             );
             let create = |size, weight| {
-                CreateFontW(
+                ultra_bar_native_ui::fonts::create_font(
                     -unit(size),
                     0,
                     0,
@@ -495,7 +495,7 @@ impl View {
                 );
                 SelectObject(dc, old);
                 SelectObject(dc, pen);
-                DeleteObject(brush);
+                ultra_bar_native_ui::fonts::delete_object(brush);
             };
             let line = |x, y, w, color| {
                 let brush = CreateSolidBrush(color);
@@ -509,7 +509,7 @@ impl View {
                     },
                     brush,
                 );
-                DeleteObject(brush);
+                ultra_bar_native_ui::fonts::delete_object(brush);
             };
             // Agent navigation replaces the former title bar. Only compact tools remain on the right.
             for (i, agent) in self.data.agents.iter().enumerate() {
@@ -768,9 +768,9 @@ impl View {
                     } else {
                         RestoreDC(dc, saved);
                     }
-                    DeleteObject(small);
-                    DeleteObject(medium);
-                    DeleteObject(value_font);
+                    ultra_bar_native_ui::fonts::delete_object(small);
+                    ultra_bar_native_ui::fonts::delete_object(medium);
+                    ultra_bar_native_ui::fonts::delete_object(value_font);
                     return;
                 }
                 let rows: Vec<_> = agent
@@ -823,7 +823,7 @@ impl View {
                     );
                     let saved = SaveDC(dc);
                     ExtSelectClipRgn(dc, clip, RGN_AND);
-                    DeleteObject(clip);
+                    ultra_bar_native_ui::fonts::delete_object(clip);
                     let mut used = 0u64;
                     for (i, part) in parts.iter().enumerate() {
                         let left = 24
@@ -851,7 +851,7 @@ impl View {
                                 },
                                 brush,
                             );
-                            DeleteObject(brush);
+                            ultra_bar_native_ui::fonts::delete_object(brush);
                         }
                     }
                     RestoreDC(dc, saved);
@@ -1377,9 +1377,9 @@ impl View {
                     0,
                 );
             }
-            DeleteObject(small);
-            DeleteObject(medium);
-            DeleteObject(value_font);
+            ultra_bar_native_ui::fonts::delete_object(small);
+            ultra_bar_native_ui::fonts::delete_object(medium);
+            ultra_bar_native_ui::fonts::delete_object(value_font);
         }
     }
 }

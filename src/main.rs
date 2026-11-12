@@ -6,6 +6,7 @@ mod color_picker;
 mod data_paths;
 mod diagnostic_watch;
 mod editors;
+mod fullscreen;
 mod input_dialog;
 mod jump_list;
 mod lifecycle;
@@ -18,6 +19,7 @@ mod settings;
 mod settings_editor;
 mod settings_window;
 mod shell;
+mod startup;
 mod task_apps;
 mod task_badge;
 mod task_click;
@@ -81,6 +83,9 @@ fn run() -> Result<()> {
         .map_err(Into::into);
     }
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|s| s == "--startup-smoke") {
+        return startup::smoke(std::path::Path::new(args.get(2).context("缺少测试目录")?));
+    }
     if args.get(1).is_some_and(|s| s == "--editor-host-smoke") {
         return unsafe {
             editors::smoke(
@@ -175,6 +180,12 @@ fn run() -> Result<()> {
     }
     if let Some(index) = args.iter().position(|arg| arg == "--profile-root") {
         data_paths::set(args.get(index + 1).context("缺少配置目录")?.into())?;
+    }
+    if args.get(1).is_some_and(|s| s == "--sync-startup") {
+        return startup::sync(args.iter().any(|s| s == "--installer-test"));
+    }
+    if args.get(1).is_some_and(|s| s == "--unregister-startup") {
+        return startup::unregister(args.iter().any(|s| s == "--installer-test"));
     }
     if args.get(1).map(String::as_str) == Some("--request-exit") {
         return lifecycle::request_exit();
@@ -323,6 +334,7 @@ fn run() -> Result<()> {
                 options.takeover = false;
             }
             "--test-modal" => {}
+            "--from-startup" => {}
             "--profile-root" => {
                 args.next().context("缺少配置目录")?;
             }

@@ -197,7 +197,7 @@ unsafe fn paint_frame(hwnd: HWND) {
             }
             SelectObject(surface.dc, old_brush);
             SelectObject(surface.dc, old_pen);
-            DeleteObject(pen);
+            crate::fonts::delete_object(pen);
             if GetWindowLongPtrW(hwnd, GWL_STYLE) & ES_MULTILINE as isize != 0 {
                 let total = SendMessageW(hwnd, EM_GETLINECOUNT, 0, 0).max(1) as i32;
                 let visible = (client.bottom / font_height(hwnd).max(1)).max(1);
@@ -222,7 +222,7 @@ unsafe fn paint_frame(hwnd: HWND) {
                     );
                     SelectObject(surface.dc, pen);
                     SelectObject(surface.dc, old);
-                    DeleteObject(brush);
+                    crate::fonts::delete_object(brush);
                 }
             }
             surface.blit_opaque(dc);
@@ -254,7 +254,7 @@ unsafe fn print_control(hwnd: HWND, target: HDC) {
             }
             SelectObject(surface.dc, brush);
             SelectObject(surface.dc, old);
-            DeleteObject(pen);
+            crate::fonts::delete_object(pen);
             let mut origin = POINT { x: 0, y: 0 };
             ClientToScreen(hwnd, &mut origin);
             let saved = SaveDC(surface.dc);

@@ -135,7 +135,7 @@ impl Form {
                 || f.id.len() > 128
                 || !ids.insert(&f.id)
                 || !(1..=2).contains(&f.span)
-                || f.options.len() > 128
+                || f.options.len() > 4096
                 || f.value.len() > 32768
                 || f.constraints.min.is_some_and(|n| !n.is_finite())
                 || f.constraints.max.is_some_and(|n| !n.is_finite())

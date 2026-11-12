@@ -10,7 +10,7 @@ struct Font(HFONT);
 impl Drop for Font {
     fn drop(&mut self) {
         unsafe {
-            DeleteObject(self.0);
+            ultra_bar_native_ui::fonts::delete_object(self.0);
         }
     }
 }
@@ -42,7 +42,7 @@ pub unsafe fn draw(
                 if fonts.len() >= 8 {
                     fonts.pop_front();
                 }
-                let font = CreateFontW(
+                let font = ultra_bar_native_ui::fonts::create_font(
                     -unit(if small { 10 } else { 11 }),
                     0,
                     0,

@@ -104,7 +104,7 @@ impl Icon {
             for rgb in [0x00102030, 0x00efcfaf] {
                 let brush = CreateSolidBrush(rgb);
                 FillRect(surface.dc, &area, brush);
-                DeleteObject(brush);
+                ultra_bar_native_ui::fonts::delete_object(brush);
                 DrawIconEx(
                     surface.dc,
                     0,

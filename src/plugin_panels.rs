@@ -80,7 +80,9 @@ pub fn launch(widget: &Widget, owner: HWND, show: bool) -> Result<()> {
         .panel
         .as_ref()
         .context("插件面板尚未构建，请运行 dev.ps1")?;
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    ultra_bar_native_ui::fonts::inherit(&mut command);
+    let mut child = command
         .env(
             "ULTRA_BAR_ACCENT",
             crate::visual::theme::hex(crate::visual::theme::accent_rgb()),

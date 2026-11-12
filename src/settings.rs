@@ -79,6 +79,9 @@ pub struct Settings {
     pub active_style: ActiveStyle,
     pub clock_format: String,
     pub clock_extension: String,
+    pub font_family: String,
+    pub startup_enabled: bool,
+    pub hide_fullscreen: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -89,12 +92,15 @@ impl Default for Settings {
             active_style: ActiveStyle::default(),
             clock_format: crate::clock::DEFAULT_FORMAT.into(),
             clock_extension: String::new(),
+            font_family: "Segoe UI".into(),
+            startup_enabled: true,
+            hide_fullscreen: true,
         }
     }
 }
 
 impl Settings {
-    fn path() -> Result<PathBuf> {
+    pub(crate) fn path() -> Result<PathBuf> {
         Ok(crate::data_paths::root()?.join("settings.json"))
     }
     pub fn load() -> Self {
@@ -130,6 +136,20 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn new_preferences_keep_old_configuration_and_preserve_explicit_opt_out() {
+        let defaults: super::Settings = serde_json::from_str("{}").unwrap();
+        assert!(defaults.startup_enabled && defaults.hide_fullscreen);
+        assert_eq!(defaults.font_family, "Segoe UI");
+        let settings: super::Settings = serde_json::from_str(
+            r#"{"startup_enabled":false,"hide_fullscreen":false,"font_family":"Arial"}"#,
+        )
+        .unwrap();
+        let roundtrip: super::Settings =
+            serde_json::from_slice(&serde_json::to_vec(&settings).unwrap()).unwrap();
+        assert!(!roundtrip.startup_enabled && !roundtrip.hide_fullscreen);
+        assert_eq!(roundtrip.font_family, "Arial");
+    }
     #[test]
     fn older_active_styles_migrate_to_the_inset_marker_without_losing_preferences() {
         for name in ["accent_inset", "solid"] {

@@ -41,6 +41,8 @@ const TRAY_UPDATE: u32 = WM_APP + 3;
 const TRAY_IMPORT_PROMPT: u32 = WM_APP + 4;
 const CLOCK_UPDATE: u32 = WM_APP + 7;
 const ENVIRONMENT_UPDATE: u32 = WM_APP + 20;
+const FULLSCREEN_UPDATE: u32 = WM_APP + 60;
+static FULLSCREEN_PENDING: AtomicBool = AtomicBool::new(false);
 const ENV_LAYOUT: u32 = 1;
 const ENV_GLASS: u32 = 2;
 const ENV_PAINT: u32 = 4;
@@ -137,6 +139,9 @@ struct State {
     shell_message: u32,
     attention: std::collections::HashMap<usize, String>,
     tray_drag: Option<(String, POINT, bool)>,
+    tray_ghost: Option<tray::drag_image::Ghost>,
+    fullscreen_hidden: bool,
+    native_fullscreen: Option<usize>,
     tray_rect: RECT,
     isolated: bool,
     hwnd: HWND,
@@ -202,10 +207,10 @@ impl Drop for State {
                 restore_native(&self.hidden, original, std::process::id());
             }
             if !self.font.is_null() {
-                DeleteObject(self.font);
+                ultra_bar_native_ui::fonts::delete_object(self.font);
             }
             if !self.icon_font.is_null() {
-                DeleteObject(self.icon_font);
+                ultra_bar_native_ui::fonts::delete_object(self.icon_font);
             }
         }
     }
@@ -220,6 +225,7 @@ pub fn run(options: Options) -> Result<()> {
             None
         };
         let initial_settings = Settings::load();
+        visual::fonts::configure(Settings::path()?, &initial_settings.font_family);
         visual::theme::set_accent(
             visual::theme::parse_hex(&initial_settings.accent_color)
                 .unwrap_or(visual::theme::DEFAULT_ACCENT),
@@ -277,6 +283,9 @@ pub fn run(options: Options) -> Result<()> {
             shell_message: RegisterWindowMessageW(wide("SHELLHOOK").as_ptr()),
             attention: std::collections::HashMap::new(),
             tray_drag: None,
+            tray_ghost: None,
+            fullscreen_hidden: false,
+            native_fullscreen: None,
             tray_rect: zeroed(),
             isolated: options.isolated,
             hwnd: null_mut(),
@@ -451,6 +460,9 @@ pub fn run(options: Options) -> Result<()> {
             }
             state.appbar = true;
         }
+        state.fullscreen_hidden = !state.isolated
+            && state.settings.hide_fullscreen
+            && crate::fullscreen::active(hwnd, None);
         position(&mut state);
         if let Some(directory) = options.visual_smoke {
             let result = smoke_taskbar(&mut state, &directory);
@@ -459,6 +471,14 @@ pub fn run(options: Options) -> Result<()> {
             CloseHandle(mutex);
             return result;
         }
+        if options.takeover
+            && !options.isolated
+            && !std::env::args().any(|a| a == "--from-startup")
+            && let Err(error) = crate::startup::set(state.settings.startup_enabled, false)
+        {
+            eprintln!("[startup] {error:#}");
+        }
+        refresh_fullscreen(&mut state);
         let hook = SetWinEventHook(
             EVENT_OBJECT_CREATE,
             EVENT_OBJECT_NAMECHANGE,
@@ -478,7 +498,7 @@ pub fn run(options: Options) -> Result<()> {
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         );
         SetTimer(hwnd, 1, 1000, None);
-        if !options.isolated {
+        if !options.isolated && !state.fullscreen_hidden {
             ShowWindow(hwnd, SW_SHOWNOACTIVATE);
         }
         if options.isolated && std::env::args().any(|arg| arg == "--test-modal") {
@@ -526,6 +546,17 @@ unsafe extern "system" fn win_event(
     _: u32,
 ) {
     TASKS_DIRTY.store(true, Ordering::Relaxed);
+    if (event == EVENT_SYSTEM_FOREGROUND
+        || (event == EVENT_OBJECT_LOCATIONCHANGE && object == 0 && child == 0))
+        && !FULLSCREEN_PENDING.swap(true, Ordering::Relaxed)
+    {
+        unsafe {
+            let owner = FindWindowW(wide("UltraBar.Window").as_ptr(), null());
+            if owner.is_null() || PostMessageW(owner, FULLSCREEN_UPDATE, 0, 0) == 0 {
+                FULLSCREEN_PENDING.store(false, Ordering::Relaxed);
+            }
+        }
+    }
     if event == EVENT_SYSTEM_FOREGROUND && !hwnd.is_null() {
         let mut pid = 0;
         unsafe {
@@ -544,9 +575,9 @@ unsafe extern "system" fn win_event(
 unsafe fn set_font(state: &mut State) {
     unsafe {
         if !state.font.is_null() {
-            DeleteObject(state.font);
+            ultra_bar_native_ui::fonts::delete_object(state.font);
         }
-        state.font = CreateFontW(
+        state.font = ultra_bar_native_ui::fonts::create_font(
             -(if state.settings.size == TaskbarSize::Small {
                 12
             } else {
@@ -568,9 +599,9 @@ unsafe fn set_font(state: &mut State) {
             wide("Segoe UI").as_ptr(),
         );
         if !state.icon_font.is_null() {
-            DeleteObject(state.icon_font);
+            ultra_bar_native_ui::fonts::delete_object(state.icon_font);
         }
-        state.icon_font = CreateFontW(
+        state.icon_font = ultra_bar_native_ui::fonts::create_font(
             -(if state.settings.size == TaskbarSize::Small {
                 16
             } else {
@@ -596,6 +627,105 @@ unsafe fn set_font(state: &mut State) {
             })
             .as_ptr(),
         );
+    }
+}
+unsafe fn refresh_fullscreen(state: &mut State) {
+    unsafe {
+        let hidden = !state.isolated
+            && state.settings.hide_fullscreen
+            && crate::fullscreen::active(state.hwnd, state.native_fullscreen);
+        if hidden == state.fullscreen_hidden {
+            return;
+        }
+        state.fullscreen_hidden = hidden;
+        if hidden {
+            if let Some(popup) = &mut state.tray_popup {
+                popup.hide();
+            }
+            PostMessageW(state.hwnd, WM_CANCELMODE, 0, 0);
+            state.tray_ghost = None;
+            state.tray_drag = None;
+            if let Some(popup) = &mut state.task_popup {
+                popup.hide();
+            }
+            if let Some(host) = &state.tray_host {
+                state.tray_hover.leave(&host.sender);
+            }
+            ShowWindow(state.hwnd, SW_HIDE);
+        } else {
+            SetWindowPos(
+                state.hwnd,
+                HWND_TOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+        ultra_bar_native_ui::diagnostics::event(
+            "shell",
+            "fullscreen.visibility",
+            serde_json::json!({"hidden":hidden,"foreground":GetForegroundWindow() as usize}),
+        );
+    }
+}
+fn show_font_picker(state: &mut State) {
+    use ultra_bar_plugin_sdk::editors::{Field, Form, Kind, OptionItem};
+    let fonts = visual::fonts::installed();
+    let mut field = Field::new(
+        "family",
+        "默认字体",
+        Kind::Select,
+        &state.settings.font_family,
+    );
+    field.options = fonts
+        .into_iter()
+        .map(|name| OptionItem {
+            value: name.clone(),
+            label: name,
+        })
+        .collect();
+    if !field.options.iter().any(|o| o.value == field.value) {
+        field.value = field
+            .options
+            .first()
+            .map(|o| o.value.clone())
+            .unwrap_or_default();
+    }
+    let owner = state.hwnd as usize;
+    let result = state.editors.open_local(
+        Form {
+            session: 1,
+            title: "默认字体".into(),
+            fields: vec![field],
+            can_delete: false,
+        },
+        move |values| {
+            let name = values.get("family").context("请选择字体")?;
+            anyhow::ensure!(visual::fonts::valid(name), "字体名称无效");
+            let mut settings = Settings::load();
+            settings.font_family = name.clone();
+            settings.save()?;
+            unsafe extern "system" fn notify(hwnd: HWND, value: isize) -> BOOL {
+                unsafe {
+                    if hwnd == value as HWND || GetAncestor(hwnd, GA_ROOTOWNER) == value as HWND {
+                        PostMessageW(hwnd, visual::fonts::message(), 0, 0);
+                    }
+                    1
+                }
+            }
+            unsafe {
+                EnumWindows(Some(notify), owner as isize);
+            }
+            Ok(())
+        },
+    );
+    if let Err(error) = result {
+        app_error(state.hwnd, &error);
+    }
+    unsafe {
+        PostMessageW(state.hwnd, crate::editors::UPDATE, 0, 0);
     }
 }
 
@@ -779,7 +909,12 @@ unsafe fn position(state: &mut State) {
                 rect.top,
                 rect.right - rect.left,
                 rect.bottom - rect.top,
-                SWP_NOACTIVATE | if state.isolated { 0 } else { SWP_SHOWWINDOW },
+                SWP_NOACTIVATE
+                    | if state.isolated || state.fullscreen_hidden {
+                        0
+                    } else {
+                        SWP_SHOWWINDOW
+                    },
             );
         }
         InvalidateRect(state.hwnd, null(), 0);
@@ -1790,6 +1925,18 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
             return DefWindowProcW(hwnd, message, w, l);
         }
         let state = &mut *ptr;
+        if message == visual::fonts::message() {
+            state.settings = Settings::load();
+            visual::fonts::configure(
+                Settings::path().unwrap_or_default(),
+                &state.settings.font_family,
+            );
+            set_font(state);
+            visual::fonts::refresh_thread();
+            refresh_settings(state);
+            InvalidateRect(hwnd, null(), 0);
+            return 0;
+        }
         if message == service_diagnostics_message() {
             let tray_labels:Vec<_>=state.tray_snapshot.items.iter().filter(|item|item.executable.to_ascii_lowercase().ends_with("weixin.exe")).map(|item|serde_json::json!({"key":item.key,"blank":item.title.trim().is_empty(),"chars":item.title.chars().count()})).collect();
             eprintln!(
@@ -1916,6 +2063,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
             return 1;
         }
         match message {
+            FULLSCREEN_UPDATE => {
+                FULLSCREEN_PENDING.store(false, Ordering::Relaxed);
+                refresh_fullscreen(state);
+                0
+            }
             WM_COPYDATA if l != 0 => {
                 let packet =
                     &*(l as *const windows_sys::Win32::System::DataExchange::COPYDATASTRUCT);
@@ -2061,6 +2213,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_TIMER => {
+                if w == 1 {
+                    refresh_fullscreen(state);
+                }
                 if w == tray::HOVER_TIMER {
                     KillTimer(hwnd, tray::HOVER_TIMER);
                     let mut point: POINT = zeroed();
@@ -2244,6 +2399,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             APPBAR_UPDATE => {
+                if w == ABN_FULLSCREENAPP as usize {
+                    state.native_fullscreen = (l != 0).then(|| GetForegroundWindow() as usize);
+                    SetWindowPos(
+                        hwnd,
+                        if l != 0 { HWND_BOTTOM } else { HWND_TOPMOST },
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                    refresh_fullscreen(state);
+                }
                 if w == ABN_POSCHANGED as usize {
                     queue_environment(state, ENV_LAYOUT | ENV_PAINT);
                 }
@@ -2392,6 +2560,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 let y = ((l >> 16) as u16) as i16 as i32;
                 let action = hit_action(state, x, y);
                 if let Some((key, _, active)) = state.tray_drag.take() {
+                    state.tray_ghost = None;
+                    if let Some(popup) = &mut state.tray_popup {
+                        popup.end_drag();
+                    }
                     ReleaseCapture();
                     if active {
                         let mut point = POINT { x, y };
@@ -2451,6 +2623,27 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 }
                 if state.drag.is_some() {
                     drag_move(state, x, y);
+                }
+                if let Some((key, _, true)) = &state.tray_drag {
+                    if state.tray_ghost.is_none()
+                        && let Some(item) = state
+                            .tray_snapshot
+                            .items
+                            .iter()
+                            .find(|item| item.key == *key)
+                    {
+                        state.tray_ghost =
+                            tray::drag_image::Ghost::new(item.icon.handle(), state.dpi);
+                    }
+                    if let Some(ghost) = &state.tray_ghost {
+                        ghost.follow();
+                    }
+                    if let Some(popup) = &mut state.tray_popup {
+                        let mut point: POINT = zeroed();
+                        if GetCursorPos(&mut point) != 0 {
+                            popup.drag_feedback(point);
+                        }
+                    }
                 }
                 let hovered = state.hits.iter().position(|hit| {
                     x >= hit.rect.left
@@ -2543,6 +2736,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                     SetTimer(hwnd, 5, crate::task_drag::SETTLE_MS, None);
                 }
                 state.tray_drag = None;
+                state.tray_ghost = None;
+                if let Some(popup) = &mut state.tray_popup {
+                    popup.end_drag();
+                }
                 if message == WM_CANCELMODE && GetCapture() == hwnd {
                     ReleaseCapture();
                 }
@@ -2551,6 +2748,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_RBUTTONUP => {
+                if state
+                    .tray_drag
+                    .as_ref()
+                    .is_some_and(|(_, _, active)| *active)
+                {
+                    PostMessageW(hwnd, WM_CANCELMODE, 0, 0);
+                    return 0;
+                }
                 if let Some(host) = &state.tray_host {
                     state.tray_hover.leave(&host.sender);
                 }
@@ -2641,7 +2846,7 @@ unsafe fn paint(state: &mut State) {
         let old_font = SelectObject(buffer, state.font);
         let background = CreateSolidBrush(visual::theme::palette().background);
         FillRect(buffer, &area, background);
-        DeleteObject(background);
+        ultra_bar_native_ui::fonts::delete_object(background);
         SetBkMode(buffer, TRANSPARENT as _);
         SetTextColor(buffer, crate::visual::theme::palette().text);
         state.hits.clear();
@@ -2797,7 +3002,7 @@ unsafe fn paint(state: &mut State) {
                 } else {
                     let brush = CreateSolidBrush(visual::theme::palette().hover);
                     FillRect(buffer, &rect, brush);
-                    DeleteObject(brush);
+                    ultra_bar_native_ui::fonts::delete_object(brush);
                 }
             }
             let mut text_rect = RECT {
@@ -2911,7 +3116,7 @@ unsafe fn paint(state: &mut State) {
                             unit(8),
                         );
                         SelectClipRgn(buffer, clip);
-                        DeleteObject(clip);
+                        ultra_bar_native_ui::fonts::delete_object(clip);
                         IntersectClipRect(buffer, rect.left, rect.top, rect.right, rect.bottom);
                         let displacement = ((rect.bottom - rect.top) as f64 * (1.0 - phase)) as i32;
                         let mut current = RECT {
@@ -3172,7 +3377,7 @@ unsafe fn paint(state: &mut State) {
                             brush,
                         );
                     }
-                    DeleteObject(brush);
+                    ultra_bar_native_ui::fonts::delete_object(brush);
                 }
                 Err(error) => {
                     eprintln!("[drag] compose: {error}");
@@ -4051,6 +4256,25 @@ fn settings_snapshot(state: &State) -> crate::settings_window::Snapshot {
                 ),
                 row(17, "激活样式", state.settings.active_style.label()),
                 row(14, "主色", &state.settings.accent_color),
+                row(40, "默认字体", &state.settings.font_family),
+                row(
+                    41,
+                    "开机启动",
+                    if state.settings.startup_enabled {
+                        "开启"
+                    } else {
+                        "关闭"
+                    },
+                ),
+                row(
+                    42,
+                    "全屏时隐藏",
+                    if state.settings.hide_fullscreen {
+                        "开启"
+                    } else {
+                        "关闭"
+                    },
+                ),
                 row(15, "恢复默认主色", ""),
                 row(13, "同步系统固定应用", ""),
             ],
@@ -4128,6 +4352,40 @@ unsafe fn settings_action(state: &mut State, result: usize) {
             .settings_window
             .as_ref()
             .map_or(state.hwnd, |w| w.hwnd());
+        if result == 40 {
+            show_font_picker(state);
+            return;
+        }
+        if result == 41 {
+            let mut next = state.settings.clone();
+            next.startup_enabled = !next.startup_enabled;
+            let result = crate::startup::set(next.startup_enabled, state.isolated)
+                .and_then(|()| next.save());
+            match result {
+                Ok(()) => {
+                    state.settings = next;
+                    refresh_settings(state);
+                }
+                Err(error) => {
+                    let _ = crate::startup::set(state.settings.startup_enabled, state.isolated);
+                    app_error(hwnd, &error);
+                }
+            }
+            return;
+        }
+        if result == 42 {
+            let mut next = state.settings.clone();
+            next.hide_fullscreen = !next.hide_fullscreen;
+            match next.save() {
+                Ok(()) => {
+                    state.settings = next;
+                    refresh_fullscreen(state);
+                    refresh_settings(state);
+                }
+                Err(error) => app_error(hwnd, &error),
+            }
+            return;
+        }
         if result == 90 {
             if let Some((id, revision, values)) =
                 state.settings_window.as_mut().and_then(|w| w.take_save())

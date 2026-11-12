@@ -80,9 +80,12 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 var Code: Integer;
 begin
-  if CurStep = ssPostInstall then
+  if CurStep = ssPostInstall then begin
     if not Exec(ExpandConstant('{app}\ultra-bar.exe'), '--register-plugin-association{#AssociationArgs}', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
       RaiseException('Unable to register plugin packages. / 无法注册插件包文件关联。');
+    if not Exec(ExpandConstant('{app}\ultra-bar.exe'), '--sync-startup{#AssociationArgs}', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
+      RaiseException('Unable to configure logon startup. / 无法设置开机启动。');
+  end;
 end;
 
 function InitializeUninstall: Boolean;
@@ -93,6 +96,9 @@ begin
     if not UninstallSilent then MsgBox('Please save and close Ultra Bar editors or dialogs, then retry. / 请保存并关闭 Ultra Bar 编辑器或对话框，然后重试。', mbError, MB_OK);
     exit;
   end;
+  if FileExists(ExpandConstant('{app}\ultra-bar.exe')) then
+    if not Exec(ExpandConstant('{app}\ultra-bar.exe'), '--unregister-startup{#AssociationArgs}', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
+      Log('Unable to remove owned startup entry.');
   if FileExists(ExpandConstant('{app}\ultra-bar.exe')) then
     if not Exec(ExpandConstant('{app}\ultra-bar.exe'), '--unregister-plugin-association{#AssociationArgs}', ExpandConstant('{app}'), SW_HIDE, ewWaitUntilTerminated, Code) or (Code <> 0) then
       Log('File association belongs to another installation or could not be removed; leaving it untouched.');

@@ -89,10 +89,10 @@ impl Drop for Hub {
                 DestroyWindow(self.state.hwnd);
             }
             if !self.state.font.is_null() {
-                DeleteObject(self.state.font);
+                ultra_bar_native_ui::fonts::delete_object(self.state.font);
             }
             if !self.state.icons.is_null() {
-                DeleteObject(self.state.icons);
+                ultra_bar_native_ui::fonts::delete_object(self.state.icons);
             }
         }
     }
@@ -372,10 +372,10 @@ impl Hub {
             self.state.dpi = dpi;
             for font in [&mut self.state.font, &mut self.state.icons] {
                 if !font.is_null() {
-                    DeleteObject(*font);
+                    ultra_bar_native_ui::fonts::delete_object(*font);
                 }
             }
-            self.state.font = CreateFontW(
+            self.state.font = ultra_bar_native_ui::fonts::create_font(
                 -13 * dpi / 96,
                 0,
                 0,
@@ -391,7 +391,7 @@ impl Hub {
                 DEFAULT_PITCH as _,
                 wide("Segoe UI").as_ptr(),
             );
-            self.state.icons = CreateFontW(
+            self.state.icons = ultra_bar_native_ui::fonts::create_font(
                 -18 * dpi / 96,
                 0,
                 0,
@@ -638,7 +638,7 @@ unsafe fn fill(dc: HDC, rect: &RECT, color: u32, radius: i32) {
         );
         SelectObject(dc, pen);
         SelectObject(dc, old);
-        DeleteObject(brush);
+        ultra_bar_native_ui::fonts::delete_object(brush);
     }
 }
 unsafe fn paint(state: &mut State) {
@@ -655,7 +655,7 @@ unsafe fn paint(state: &mut State) {
         let old = SelectObject(dc, state.font);
         let brush = CreateSolidBrush(crate::visual::theme::palette().background);
         FillRect(dc, &area, brush);
-        DeleteObject(brush);
+        ultra_bar_native_ui::fonts::delete_object(brush);
         SetBkMode(dc, TRANSPARENT as _);
         let unit = |n: i32| n * state.dpi / 96;
         let text = |value: &str, mut rect: RECT, color: u32| {
@@ -1120,7 +1120,7 @@ pub fn smoke(directory: PathBuf) -> Result<()> {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ultra-bar-plugins");
         let mut hub = Hub::new(null_mut(), root.clone());
         let state = &mut hub.state;
-        state.font = CreateFontW(
+        state.font = ultra_bar_native_ui::fonts::create_font(
             -13,
             0,
             0,
@@ -1136,7 +1136,7 @@ pub fn smoke(directory: PathBuf) -> Result<()> {
             DEFAULT_PITCH as _,
             wide("Segoe UI").as_ptr(),
         );
-        state.icons = CreateFontW(
+        state.icons = ultra_bar_native_ui::fonts::create_font(
             -18,
             0,
             0,

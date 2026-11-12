@@ -317,7 +317,7 @@ pub unsafe fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
             };
             let brush = CreateSolidBrush(p.background);
             FillRect(surface.dc, &area, brush);
-            DeleteObject(brush);
+            ultra_bar_native_ui::fonts::delete_object(brush);
             SetBkMode(surface.dc, TRANSPARENT as i32);
             SetTextColor(surface.dc, p.text);
             let old = SelectObject(surface.dc, GetStockObject(DEFAULT_GUI_FONT));

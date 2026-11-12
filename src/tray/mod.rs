@@ -1,3 +1,4 @@
+pub mod drag_image;
 mod hover;
 mod hover_popup;
 pub use hover_popup::event as hover_popup_event;

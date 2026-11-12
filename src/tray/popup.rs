@@ -33,6 +33,8 @@ struct State {
     hover: super::Hover,
     cancelled_click: bool,
     drag: Option<(String, POINT, bool)>,
+    ghost: Option<super::drag_image::Ghost>,
+    drop_target: bool,
     dropped: Option<(String, POINT)>,
     hwnd: HWND,
     owner: HWND,
@@ -58,13 +60,34 @@ impl Drop for Popup {
                 DestroyWindow(self.state.hwnd);
             }
             if !self.state.font.is_null() {
-                DeleteObject(self.state.font);
+                ultra_bar_native_ui::fonts::delete_object(self.state.font);
             }
         }
     }
 }
 
 impl Popup {
+    pub unsafe fn drag_feedback(&mut self, point: POINT) {
+        unsafe {
+            let active = self.contains(point);
+            if active != self.state.drop_target {
+                self.state.drop_target = active;
+                InvalidateRect(self.state.hwnd, null(), 0);
+            }
+        }
+    }
+    pub unsafe fn end_drag(&mut self) {
+        unsafe {
+            self.state.drop_target = false;
+            InvalidateRect(self.state.hwnd, null(), 0);
+        }
+    }
+    pub unsafe fn hide(&mut self) {
+        unsafe {
+            PostMessageW(self.state.hwnd, WM_CANCELMODE, 0, 0);
+            ShowWindow(self.state.hwnd, SW_HIDE);
+        }
+    }
     pub unsafe fn contains(&self, point: POINT) -> bool {
         unsafe {
             let mut rect: RECT = zeroed();
@@ -107,6 +130,8 @@ impl Popup {
                 hover: super::Hover::default(),
                 cancelled_click: false,
                 drag: None,
+                ghost: None,
+                drop_target: false,
                 dropped: None,
                 hwnd: null_mut(),
                 owner,
@@ -186,9 +211,9 @@ impl Popup {
             }
             self.state.dpi = dpi;
             if !self.state.font.is_null() {
-                DeleteObject(self.state.font);
+                ultra_bar_native_ui::fonts::delete_object(self.state.font);
             }
-            self.state.font = CreateFontW(
+            self.state.font = ultra_bar_native_ui::fonts::create_font(
                 -13 * dpi / 96,
                 0,
                 0,
@@ -330,6 +355,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_KEYDOWN if w == 0x1b => {
+                state.ghost = None;
+                state.drag = None;
+                if GetCapture() == hwnd {
+                    ReleaseCapture();
+                }
                 ShowWindow(hwnd, SW_HIDE);
                 0
             }
@@ -412,6 +442,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                         || (y - start.y).abs()
                             >= GetSystemMetricsForDpi(SM_CYDRAG, state.dpi as u32).max(4);
                 }
+                if let Some((key, _, true)) = &state.drag {
+                    if state.ghost.is_none()
+                        && let Some(item) =
+                            state.snapshot.items.iter().find(|item| item.key == *key)
+                    {
+                        state.ghost = super::drag_image::Ghost::new(item.icon.handle(), state.dpi);
+                    }
+                    if let Some(ghost) = &state.ghost {
+                        ghost.follow();
+                    }
+                }
                 0
             }
             WM_MOUSEHOVER => {
@@ -423,6 +464,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_SHOWWINDOW if w == 0 => {
+                state.drop_target = false;
+                state.ghost = None;
                 state.hover.leave(&state.sender);
                 0
             }
@@ -431,6 +474,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_CAPTURECHANGED | WM_CANCELMODE => {
+                state.ghost = None;
                 if state.drag.is_some() {
                     state.cancelled_click = true;
                 }
@@ -441,6 +485,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_LBUTTONUP | WM_RBUTTONUP | WM_LBUTTONDBLCLK => {
+                state.ghost = None;
                 state.hover.leave(&state.sender);
                 if message == WM_LBUTTONUP && state.cancelled_click {
                     state.cancelled_click = false;
@@ -526,7 +571,7 @@ unsafe fn paint(state: &mut State) {
         let old = SelectObject(dc, state.font);
         let brush = CreateSolidBrush(visual::theme::palette().background);
         FillRect(dc, &area, brush);
-        DeleteObject(brush);
+        ultra_bar_native_ui::fonts::delete_object(brush);
         SetBkMode(dc, TRANSPARENT as _);
         SetTextColor(dc, crate::visual::theme::palette().text);
         let unit = |n: i32| n * state.dpi / 96;
@@ -595,7 +640,7 @@ unsafe fn paint(state: &mut State) {
             };
             let brush = CreateSolidBrush(visual::theme::palette().hover);
             FillRect(dc, &rect, brush);
-            DeleteObject(brush);
+            ultra_bar_native_ui::fonts::delete_object(brush);
             text(
                 label,
                 RECT {
@@ -615,6 +660,20 @@ unsafe fn paint(state: &mut State) {
             button(right - 30, 18, "›", Action::Next);
         }
         SelectObject(dc, old);
+        if state.drop_target {
+            let brush = CreateSolidBrush(visual::theme::palette().active_border);
+            FrameRect(
+                surface.dc,
+                &RECT {
+                    left: 2,
+                    top: 2,
+                    right: area.right - 2,
+                    bottom: area.bottom - 2,
+                },
+                brush,
+            );
+            ultra_bar_native_ui::fonts::delete_object(brush);
+        }
         surface.present(state.hwnd, state.glass);
         if let Some(tips) = &mut state.tips {
             tips.sync(

@@ -58,7 +58,7 @@ impl Window {
             });
             let dpi = GetDpiForWindow(owner).max(96) as i32;
             let font = |face: &str, height: i32, weight: i32| {
-                CreateFontW(
+                ultra_bar_native_ui::fonts::create_font(
                     -height * dpi / 96,
                     0,
                     0,
@@ -111,9 +111,9 @@ impl Window {
                 (&mut *state as *mut State).cast(),
             );
             if hwnd.is_null() {
-                DeleteObject(state.font);
-                DeleteObject(state.heading);
-                DeleteObject(state.icons);
+                ultra_bar_native_ui::fonts::delete_object(state.font);
+                ultra_bar_native_ui::fonts::delete_object(state.heading);
+                ultra_bar_native_ui::fonts::delete_object(state.icons);
                 return None;
             }
             let glass = crate::visual::enable_glass(hwnd);
@@ -244,9 +244,9 @@ impl Drop for Window {
     fn drop(&mut self) {
         unsafe {
             DestroyWindow(self.hwnd);
-            DeleteObject(self.state.font);
-            DeleteObject(self.state.heading);
-            DeleteObject(self.state.icons);
+            ultra_bar_native_ui::fonts::delete_object(self.state.font);
+            ultra_bar_native_ui::fonts::delete_object(self.state.heading);
+            ultra_bar_native_ui::fonts::delete_object(self.state.icons);
         }
     }
 }
@@ -446,7 +446,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                                 unit(12),
                             );
                             SelectObject(dc, b);
-                            DeleteObject(brush);
+                            ultra_bar_native_ui::fonts::delete_object(brush);
                         }
                         text(
                             tab,
@@ -513,8 +513,22 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                             SelectObject(dc, b);
                             text(&row.title, 200, y + 5, 420, 25, palette.text);
                             text(&row.detail, 200, y + 29, 420, 20, palette.muted);
-                            SelectObject(dc, s.icons);
-                            text("\u{e76c}", 644, y + 14, 24, 28, palette.muted);
+                            if matches!(row.command, 41 | 42) {
+                                ultra_bar_native_ui::form::draw_switch(
+                                    dc,
+                                    RECT {
+                                        left: unit(620),
+                                        top: unit(y + 18),
+                                        right: unit(660),
+                                        bottom: unit(y + 40),
+                                    },
+                                    row.detail == "开启",
+                                    true,
+                                );
+                            } else {
+                                SelectObject(dc, s.icons);
+                                text("\u{e76c}", 644, y + 14, 24, 28, palette.muted);
+                            }
                             SelectObject(dc, s.font);
                         }
                     }

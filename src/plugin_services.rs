@@ -151,7 +151,9 @@ impl Worker {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("插件尚未构建"))?;
         let job = Job::new(relative_cpu(5, global_cpu), 384 * 1024 * 1024)?;
-        let mut child = Command::new(binary)
+        let mut command = Command::new(binary);
+        ultra_bar_native_ui::fonts::inherit(&mut command);
+        let mut child = command
             .args(["--service", "--owner", &owner.to_string()])
             .current_dir(&widget.root)
             .env("ULTRA_BAR_ACCENT", theme::hex(theme::accent_rgb()))

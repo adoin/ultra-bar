@@ -15,6 +15,7 @@ use windows_sys::{
 };
 pub mod diagnostics;
 pub mod editor_bridge;
+pub mod fonts;
 pub mod form;
 pub mod input;
 pub mod packaged_icon;
@@ -270,10 +271,10 @@ unsafe fn icon_width(icon: HICON) -> i32 {
             (&mut bitmap as *mut BITMAP).cast(),
         );
         if !info.hbmColor.is_null() {
-            DeleteObject(info.hbmColor);
+            crate::fonts::delete_object(info.hbmColor);
         }
         if !info.hbmMask.is_null() {
-            DeleteObject(info.hbmMask);
+            crate::fonts::delete_object(info.hbmMask);
         }
         bitmap.bmWidth
     }
@@ -736,7 +737,7 @@ impl Drop for Surface {
         unsafe {
             text::unregister(self.dc);
             SelectObject(self.dc, self.old_bitmap);
-            DeleteObject(self.bitmap);
+            crate::fonts::delete_object(self.bitmap);
             DeleteDC(self.dc);
         }
     }
@@ -813,6 +814,7 @@ impl Tooltips {
             SendMessageW(window, TTM_SETMAXTIPWIDTH, 0, 640);
             SendMessageW(window, TTM_SETDELAYTIME, TTDT_INITIAL as _, 450);
             SendMessageW(window, TTM_SETDELAYTIME, TTDT_AUTOPOP as _, 15000);
+            crate::fonts::refresh_tree(window);
             Self {
                 window,
                 owner,
@@ -917,7 +919,7 @@ mod tests {
             };
             let brush = CreateSolidBrush(0x00352a21);
             FillRect(source.dc, &rect, brush);
-            DeleteObject(brush);
+            crate::fonts::delete_object(brush);
             let inner = RECT {
                 left: 3,
                 top: 3,
@@ -1088,7 +1090,7 @@ mod tests {
             FillRect(surface.dc, &rect, theme::background_brush());
             SetBkMode(surface.dc, TRANSPARENT as _);
             SetTextColor(surface.dc, 0xffffff);
-            let font = CreateFontW(
+            let font = crate::fonts::create_font(
                 -13,
                 0,
                 0,
@@ -1126,7 +1128,7 @@ mod tests {
                 }
             }
             SelectObject(surface.dc, old);
-            DeleteObject(font);
+            crate::fonts::delete_object(font);
         }
     }
     #[test]
