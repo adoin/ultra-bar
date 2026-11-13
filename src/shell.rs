@@ -2915,17 +2915,27 @@ unsafe fn paint(state: &mut State) {
                 )
             })
             .unwrap_or_else(|| (state.time.clone(), String::new()));
-        let mut clock_measure: SIZE = zeroed();
-        let clock_wide = wide(&clock_text);
-        GetTextExtentPoint32W(
-            buffer,
-            clock_wide.as_ptr(),
-            (clock_wide.len() - 1) as _,
-            &mut clock_measure,
-        );
-        let clock_width = tray_width(clock_measure.cx)
-            .max(unit(40))
-            .min(area.right / 2);
+        let clock_pages = clock_provider
+            .map(|widget| {
+                state.clock_feed.width_texts(
+                    &widget.id,
+                    &widget.text,
+                    &state.time,
+                    &state.settings.clock_format,
+                )
+            })
+            .unwrap_or_else(|| [clock_text.clone(), clock_text.clone()]);
+        let widest_clock = clock_pages
+            .iter()
+            .map(|page| {
+                let mut measure: SIZE = zeroed();
+                let text = wide(page);
+                GetTextExtentPoint32W(buffer, text.as_ptr(), (text.len() - 1) as _, &mut measure);
+                measure.cx
+            })
+            .max()
+            .unwrap_or(0);
+        let clock_width = tray_width(widest_clock).max(unit(40)).min(area.right / 2);
         if state.gpu_meter.is_none()
             && !state.gpu_meter_failed
             && state
@@ -3034,7 +3044,12 @@ unsafe fn paint(state: &mut State) {
                 }
             }
             let content = if group.is_some() {
-                crate::task_relief::content_rect(&rect, state.dpi, active, state.settings.active_style)
+                crate::task_relief::content_rect(
+                    &rect,
+                    state.dpi,
+                    active,
+                    state.settings.active_style,
+                )
             } else {
                 rect
             };

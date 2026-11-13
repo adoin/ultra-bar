@@ -106,6 +106,20 @@ impl Feed {
         changed || rotate
     }
     pub fn render(&self, id: &str, template: &str, time: &str, pattern: &str) -> (String, String) {
+        self.render_phase(id, template, time, pattern, self.phase)
+    }
+    /// Reserve the widest page before rotating, including the template and lunar date.
+    pub fn width_texts(&self, id: &str, template: &str, time: &str, pattern: &str) -> [String; 2] {
+        [0, 1].map(|phase| self.render_phase(id, template, time, pattern, phase).0)
+    }
+    fn render_phase(
+        &self,
+        id: &str,
+        template: &str,
+        time: &str,
+        pattern: &str,
+        phase: u64,
+    ) -> (String, String) {
         let Some(summary) = self
             .summaries
             .get(id)
@@ -131,7 +145,7 @@ impl Feed {
         } else {
             match summary.display {
                 1 => format!("{time}  {weather}"),
-                2 if self.phase % 2 == 1 => weather.clone(),
+                2 if phase % 2 == 1 => weather.clone(),
                 _ => time,
             }
         };
@@ -216,7 +230,14 @@ mod tests {
         assert!(tip.contains("星期"));
         assert!(!tip.trim().is_empty());
         feed.summaries.get_mut("calendar").unwrap().display = 2;
+        let pages = feed.width_texts("calendar", "[{time}]", "fallback", "HH:mm");
+        assert!(pages[0].ends_with("正月初一]"));
+        assert_eq!(pages[1], "[晴 16°C]");
         feed.phase = 1;
+        assert_eq!(
+            pages,
+            feed.width_texts("calendar", "[{time}]", "fallback", "HH:mm")
+        );
         assert_eq!(
             feed.render("calendar", "{time}", "fallback", "HH:mm").0,
             "晴 16°C"
@@ -228,6 +249,10 @@ mod tests {
                 .ends_with("正月初一")
         );
         feed.summaries.get_mut("calendar").unwrap().updated = 0;
+        assert_eq!(
+            feed.width_texts("calendar", "{time}", "fallback", "HH:mm"),
+            ["fallback", "fallback"]
+        );
         assert_eq!(
             feed.render("calendar", "{time}", "fallback", "HH:mm").0,
             "fallback"
