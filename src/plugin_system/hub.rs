@@ -424,11 +424,7 @@ impl Hub {
                 height,
                 SWP_NOACTIVATE,
             );
-            SetWindowRgn(
-                self.state.hwnd,
-                CreateRoundRectRgn(0, 0, width, height, 20 * dpi / 96, 20 * dpi / 96),
-                1,
-            );
+            ultra_bar_native_ui::geometry::attach_rounded(self.state.hwnd, 20);
             ShowWindow(self.state.hwnd, SW_SHOW);
             SetForegroundWindow(self.state.hwnd);
             InvalidateRect(self.state.hwnd, null(), 0);

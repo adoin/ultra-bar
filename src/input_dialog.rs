@@ -95,11 +95,7 @@ pub unsafe fn edit(owner: HWND, title: &str, hint: &str, initial: &str) -> Optio
         }
         crate::visual::enable_glass(window);
         SetLayeredWindowAttributes(window, 0, 232, LWA_ALPHA);
-        SetWindowRgn(
-            window,
-            CreateRoundRectRgn(0, 0, unit(480), unit(200), unit(20), unit(20)),
-            1,
-        );
+        ultra_bar_native_ui::geometry::attach_rounded(window, 20);
         let font = GetStockObject(DEFAULT_GUI_FONT);
         let tips = CreateWindowExW(
             WS_EX_TOPMOST | WS_EX_NOACTIVATE,
@@ -178,11 +174,7 @@ pub unsafe fn edit(owner: HWND, title: &str, hint: &str, initial: &str) -> Optio
                     (EC_LEFTMARGIN | EC_RIGHTMARGIN) as _,
                     (margin | (margin << 16)) as _,
                 );
-                SetWindowRgn(
-                    child,
-                    CreateRoundRectRgn(0, 0, unit(width), unit(height), unit(10), unit(10)),
-                    1,
-                );
+                ultra_bar_native_ui::geometry::attach_rounded(child, 10);
             }
             if id == 1 || id == 2 {
                 let info = TTTOOLINFOW {

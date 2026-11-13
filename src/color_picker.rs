@@ -139,18 +139,7 @@ unsafe fn create(owner: HWND, initial: u32) -> Option<Box<Picker>> {
         state.hwnd = hwnd;
         visual::enable_glass(hwnd);
         SetLayeredWindowAttributes(hwnd, 0, 232, LWA_ALPHA);
-        SetWindowRgn(
-            hwnd,
-            CreateRoundRectRgn(
-                0,
-                0,
-                state.unit(408),
-                state.unit(390),
-                state.unit(22),
-                state.unit(22),
-            ),
-            1,
-        );
+        ultra_bar_native_ui::geometry::attach_rounded(hwnd, 22);
         state.updating = true;
         state.edit = CreateWindowExW(
             0,
@@ -176,18 +165,7 @@ unsafe fn create(owner: HWND, initial: u32) -> Option<Box<Picker>> {
             (EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize,
             (margin | (margin << 16)) as isize,
         );
-        SetWindowRgn(
-            state.edit,
-            CreateRoundRectRgn(
-                0,
-                0,
-                state.unit(132),
-                state.unit(28),
-                state.unit(8),
-                state.unit(8),
-            ),
-            1,
-        );
+        ultra_bar_native_ui::geometry::attach_rounded(state.edit, 8);
         state.updating = false;
         Some(state)
     }

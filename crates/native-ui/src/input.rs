@@ -29,6 +29,7 @@ pub unsafe fn attach(edit: HWND) {
             (EC_LEFTMARGIN | EC_RIGHTMARGIN) as usize,
             (margin | margin << 16) as isize,
         );
+        crate::geometry::attach_rounded(edit, 10);
         frame_changed(edit);
     }
 }
@@ -127,29 +128,7 @@ unsafe fn font_height(hwnd: HWND) -> i32 {
         metrics.tmHeight.max(1)
     }
 }
-unsafe fn rounded_region(hwnd: HWND) {
-    unsafe {
-        let mut rect = std::mem::zeroed();
-        GetWindowRect(hwnd, &mut rect);
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
-        if width < 2 || height < 2 {
-            return;
-        }
-        let key = crate::wide("UltraBar.Edit.RegionSize.v1");
-        let size = ((width as usize) << 16) | height as usize;
-        if GetPropW(hwnd, key.as_ptr()) as usize == size {
-            return;
-        }
-        SetPropW(hwnd, key.as_ptr(), size as HANDLE);
-        let radius = (10 * GetDpiForWindow(hwnd).max(96) / 96) as i32;
-        SetWindowRgn(
-            hwnd,
-            CreateRoundRectRgn(0, 0, width + 1, height + 1, radius, radius),
-            1,
-        );
-    }
-}
+
 unsafe fn paint_frame(hwnd: HWND) {
     unsafe {
         let mut window: RECT = std::mem::zeroed();
@@ -191,7 +170,7 @@ unsafe fn paint_frame(hwnd: HWND) {
             );
             let old_pen = SelectObject(surface.dc, pen);
             let old_brush = SelectObject(surface.dc, GetStockObject(NULL_BRUSH));
-            let radius = (10 * GetDpiForWindow(hwnd).max(96) / 96) as i32;
+            let radius = crate::geometry::corner_pixels(hwnd);
             if GetPropW(hwnd, crate::wide("UltraBar.Edit.Composite").as_ptr()).is_null() {
                 RoundRect(surface.dc, 0, 0, width, height, radius, radius);
             }
@@ -248,7 +227,7 @@ unsafe fn print_control(hwnd: HWND, target: HDC) {
             let pen = CreatePen(PS_SOLID, 1, crate::theme::palette().border);
             let old = SelectObject(surface.dc, pen);
             let brush = SelectObject(surface.dc, GetStockObject(NULL_BRUSH));
-            let r = (10 * GetDpiForWindow(hwnd).max(96) / 96) as i32;
+            let r = crate::geometry::corner_pixels(hwnd);
             if GetPropW(hwnd, crate::wide("UltraBar.Edit.Composite").as_ptr()).is_null() {
                 RoundRect(surface.dc, 0, 0, width, height, r, r);
             }
@@ -348,7 +327,6 @@ unsafe extern "system" fn proc(
     unsafe {
         if message == WM_NCDESTROY {
             RemoveWindowSubclass(hwnd, Some(proc), id);
-            RemovePropW(hwnd, crate::wide("UltraBar.Edit.RegionSize.v1").as_ptr());
             RemovePropW(hwnd, crate::wide("UltraBar.Edit.Wheel.v1").as_ptr());
             RemovePropW(hwnd, crate::wide("UltraBar.Edit.Composite").as_ptr());
         }
@@ -398,7 +376,7 @@ unsafe extern "system" fn proc(
         }
         if message == WM_SIZE {
             let result = DefSubclassProc(hwnd, message, w, l);
-            rounded_region(hwnd);
+
             return result;
         }
         if message == WM_PRINT {

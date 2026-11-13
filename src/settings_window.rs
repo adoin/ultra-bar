@@ -123,11 +123,7 @@ impl Window {
                 serde_json::json!({"hwnd":hwnd as usize,"dpi":dpi,"glass":glass,"alpha":if glass{244}else{255},"plugin_pages":state.data.plugins.len()}),
             );
             SetLayeredWindowAttributes(hwnd, 0, if glass { 244 } else { 255 }, LWA_ALPHA);
-            SetWindowRgn(
-                hwnd,
-                CreateRoundRectRgn(0, 0, w, h, 20 * dpi / 96, 20 * dpi / 96),
-                1,
-            );
+            ultra_bar_native_ui::geometry::attach_rounded(hwnd, 20);
             state
                 .editor
                 .update(hwnd, &state.data.plugins, state.font, state.dpi);

@@ -249,18 +249,7 @@ pub fn run(
         state.tips = Some(Tooltips::new(hwnd));
         sync_tips(&mut state);
         SetLayeredWindowAttributes(hwnd, 0, if state.glass { 238 } else { 255 }, LWA_ALPHA);
-        SetWindowRgn(
-            hwnd,
-            CreateRoundRectRgn(
-                0,
-                0,
-                520 * dpi / 96,
-                450 * dpi / 96,
-                18 * dpi / 96,
-                18 * dpi / 96,
-            ),
-            1,
-        );
+        ultra_bar_native_ui::geometry::attach_rounded(hwnd, 18);
         let panel = Panel {
             pending_settings: Default::default(),
             data: Default::default(),
@@ -604,11 +593,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                     height,
                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
                 );
-                SetWindowRgn(
-                    hwnd,
-                    CreateRoundRectRgn(0, 0, unit(680), height, unit(18), unit(18)),
-                    1,
-                );
+                ultra_bar_native_ui::geometry::attach_rounded(hwnd, 18);
                 InvalidateRect(hwnd, null(), 0);
                 0
             }
@@ -639,11 +624,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                         height,
                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE,
                     );
-                    SetWindowRgn(
-                        hwnd,
-                        CreateRoundRectRgn(0, 0, unit(520), height, unit(18), unit(18)),
-                        1,
-                    );
+                    ultra_bar_native_ui::geometry::attach_rounded(hwnd, 18);
                 }
                 sync_tips(s);
                 InvalidateRect(hwnd, null(), 0);

@@ -6,6 +6,8 @@
 
 ## 代码边界
 
+原生控件与弹窗的圆角区域统一交给 `geometry::attach_rounded`；宽高取实际 HWND，不在业务布局中缓存或另设窗口区域。边框绘制读取 `geometry::corner_pixels`。重复挂载同一编辑会话只更新几何，不重建控件或覆盖草稿。审计与验证范围见 [control-geometry.md](control-geometry.md)。
+
 - `crates/plugin-sdk/src/editors.rs`：数据协议；不依赖 Win32，也不包含绘制实现。
 - `src/editors/`：主进程内的编辑器提供者、控件注册与渲染。
 - `crates/native-ui/src/editor_bridge.rs`：原生插件的传输适配器；只传递声明和事件。

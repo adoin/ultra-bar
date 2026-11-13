@@ -308,11 +308,7 @@ pub unsafe fn edit(owner: HWND, title: &str, fields: Vec<Field>) -> Option<Vec<S
         }
         let glass = enable_glass(hwnd);
         SetLayeredWindowAttributes(hwnd, 0, if glass { 242 } else { 255 }, LWA_ALPHA);
-        SetWindowRgn(
-            hwnd,
-            CreateRoundRectRgn(0, 0, width, height, scale(18), scale(18)),
-            1,
-        );
+        crate::geometry::attach_rounded(hwnd, 18);
         for (i, f) in s.fields.iter().enumerate() {
             let control = if matches!(f.kind, Kind::Text | Kind::Secret) {
                 let edit = CreateWindowExW(

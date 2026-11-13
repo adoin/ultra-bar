@@ -17,6 +17,7 @@ pub mod diagnostics;
 pub mod editor_bridge;
 pub mod fonts;
 pub mod form;
+pub mod geometry;
 pub mod input;
 pub mod packaged_icon;
 pub mod popover;

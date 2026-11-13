@@ -299,14 +299,45 @@ impl Manager {
         {
             return false;
         }
+        if let Operation::Mount { session, field, .. } = &request.operation
+            && self.windows.iter().any(|w| {
+                w.0.mount
+                    && w.0.caller == caller
+                    && w.0.plugin == request.plugin_id
+                    && w.0.form.session == *session
+                    && w.0
+                        .form
+                        .fields
+                        .first()
+                        .is_some_and(|old| old.id != field.id || old.kind != field.kind)
+            })
+        {
+            return false;
+        }
         match &request.operation {
             Operation::Open { form } if form.validate_schema().is_err() => return false,
             Operation::Mount {
                 field,
+                x,
+                y,
                 width,
                 height,
                 ..
-            } if *width < 8 || *width > 4096 || *height < 8 || *height > 2048 => {
+            } if *width < 8
+                || *width > 4096
+                || *height < 8
+                || *height > 2048
+                || x.checked_add(*width).is_none()
+                || y.checked_add(*height).is_none()
+                || (Form {
+                    session: 0,
+                    title: String::new(),
+                    fields: vec![field.clone()],
+                    can_delete: false,
+                })
+                .validate_schema()
+                .is_err() =>
+            {
                 return false;
             }
             _ => {}
@@ -382,11 +413,28 @@ impl Manager {
                         width,
                         height,
                     } => {
-                        if self.windows.iter().any(|w| {
-                            w.0.plugin == request.plugin_id
-                                && w.0.form.session == session
-                                && w.0.caller == caller
-                        }) {
+                        if let Some(hwnd) = self
+                            .windows
+                            .iter()
+                            .find(|w| {
+                                w.0.plugin == request.plugin_id
+                                    && w.0.form.session == session
+                                    && w.0.caller == caller
+                                    && w.0.mount
+                            })
+                            .map(|w| w.0.hwnd)
+                        {
+                            // A repeated mount is a layout update, never a replacement of the draft.
+                            SetWindowPos(
+                                hwnd,
+                                null_mut(),
+                                x,
+                                y,
+                                width,
+                                height,
+                                SWP_NOACTIVATE | SWP_NOZORDER,
+                            );
+                            InvalidateRect(hwnd, null(), 0);
                             continue;
                         }
                         let form = Form {
@@ -850,34 +898,12 @@ unsafe fn create(
         ensure!(!hwnd.is_null(), "无法创建编辑器");
         view.hwnd = hwnd;
         if view.mount {
-            SetWindowRgn(
-                hwnd,
-                CreateRoundRectRgn(
-                    0,
-                    0,
-                    rect.right - rect.left + 1,
-                    rect.bottom - rect.top + 1,
-                    u(10),
-                    u(10),
-                ),
-                1,
-            );
+            ultra_bar_native_ui::geometry::attach_rounded(hwnd, 10);
         }
         if !view.mount {
             ultra_bar_native_ui::enable_glass(hwnd);
             SetLayeredWindowAttributes(hwnd, 0, 244, LWA_ALPHA);
-            SetWindowRgn(
-                hwnd,
-                CreateRoundRectRgn(
-                    0,
-                    0,
-                    rect.right - rect.left + 1,
-                    rect.bottom - rect.top + 1,
-                    u(20),
-                    u(20),
-                ),
-                1,
-            );
+            ultra_bar_native_ui::geometry::attach_rounded(hwnd, 20);
         }
         for (index, f) in view.form.fields.iter().enumerate() {
             let id = 1000 + index as i32;
@@ -2045,6 +2071,31 @@ pub unsafe fn smoke(directory: &std::path::Path, schema: Option<&std::path::Path
                 .find(|b| b.field.kind == Kind::Select)
                 .map(|b| b.inputs[0])
             {
+                let region = CreateRectRgn(0, 0, 0, 0);
+                let mut rect: RECT = zeroed();
+                GetWindowRect(combo, &mut rect);
+                ensure!(GetWindowRgn(combo, region) != 0, "下拉框缺少点击区域");
+                let width = rect.right - rect.left;
+                let height = rect.bottom - rect.top;
+                for x in [
+                    width / 10,
+                    width / 2,
+                    width * 9 / 10,
+                    width - 8 * view.dpi / 96,
+                ] {
+                    ensure!(
+                        PtInRegion(region, x, height / 2) != 0,
+                        "下拉框右侧被旧尺寸的窗口区域裁掉"
+                    );
+                }
+                ultra_bar_native_ui::fonts::delete_object(region);
+                let mut info: COMBOBOXINFO = zeroed();
+                info.cbSize = size_of::<COMBOBOXINFO>() as u32;
+                ensure!(
+                    GetComboBoxInfo(combo, &mut info) != 0
+                        && info.rcButton.right >= width - 8 * view.dpi / 96,
+                    "下拉箭头命中区域没有随宽度更新"
+                );
                 for _ in 0..3 {
                     SendMessageW(combo, CB_SHOWDROPDOWN, 1, 0);
                     pump_test_events();
@@ -2065,7 +2116,7 @@ pub unsafe fn smoke(directory: &std::path::Path, schema: Option<&std::path::Path
                 }
                 std::fs::write(
                     directory.join("dropdown-result.json"),
-                    b"{\"opened_repeatedly\":true,\"height_reserved\":true}",
+                    b"{\"opened_repeatedly\":true,\"height_reserved\":true,\"full_width_hit_region\":true,\"arrow_hit_region\":true}",
                 )?;
             }
             let _ = PrintWindow(view.hwnd, surface.dc, 0);
@@ -2223,6 +2274,20 @@ pub unsafe fn smoke(directory: &std::path::Path, schema: Option<&std::path::Path
             SendMessageW(h, WM_COMMAND, 9002, 0);
             local.apply(owner);
             ensure!(!local.busy() && saved.borrow().len() == 1 && IsWindowEnabled(owner) != 0, "跳过别名没有保留原状态");
+            let field=Field::new("query","",Kind::Search,"initial");
+            let mount=|width,height,value:&str| Request{protocol:PROTOCOL,plugin_id:"fixture_mount".into(),operation:Operation::Mount{
+                session:70,field:Field{value:value.into(),..field.clone()},x:20,y:30,width,height}};
+            ensure!(local.accept(owner,mount(200,28,"initial")),"首次挂载失败");local.apply(owner);
+            let mounted=local.windows.iter().find(|w|w.0.mount).context("缺少挂载编辑器")?;
+            let mounted_hwnd=mounted.0.hwnd;let input=mounted.0.bindings[0].inputs[0];
+            SendMessageW(input,EM_SETSEL,0,-1);SendMessageW(input,EM_REPLACESEL,1,wide("draft search").as_ptr() as isize);
+            ensure!(local.accept(owner,mount(640,44,"reset")),"挂载布局更新失败");local.apply(owner);
+            let mounted=local.windows.iter().find(|w|w.0.mount).context("更新后挂载丢失")?;
+            ensure!(mounted.0.hwnd==mounted_hwnd&&mounted.0.bindings[0].inputs[0]==input,"挂载更新重建了输入框");
+            let mut rect:RECT=zeroed();GetWindowRect(mounted_hwnd,&mut rect);
+            ensure!(rect.right-rect.left==640&&rect.bottom-rect.top==44&&text(input)=="draft search","挂载更新没有应用尺寸或覆盖了草稿");
+            ensure!(SendMessageW(input,EM_CANUNDO,0,0)!=0,"挂载更新破坏了撤销历史");
+            std::fs::write(directory.join("mount-layout-result.json"),b"{\"resize\":true,\"same_control\":true,\"draft_preserved\":true,\"undo_preserved\":true}")?;
             std::fs::write(directory.join("local-editor-result.json"), serde_json::to_vec_pretty(&serde_json::json!({"save":true,"skip":true,"batch_sequential":true,"global_input":false}))?)?;
             Ok(())
         });

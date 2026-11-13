@@ -66,12 +66,13 @@ pub(super) unsafe fn sync_date_input(hwnd: HWND, st: &SYSTEMTIME) {
     }
 }
 
-pub(super) unsafe fn layout_date_input(hwnd: HWND, dpi: i32) {
+pub(super) unsafe fn layout_date_input(hwnd: HWND) {
     unsafe {
         let edit = date_input(hwnd);
         if edit.is_null() {
             return;
         }
+        let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96) as i32;
         let mut r: RECT = zeroed();
         GetClientRect(hwnd, &mut r);
         let u = |n| n * dpi / 96;
@@ -273,7 +274,7 @@ pub(super) unsafe fn attach_date_input(hwnd: HWND, font: HFONT, dpi: i32) {
         }
         theme_time_children(hwnd);
         sync_date_input(hwnd, &st);
-        layout_date_input(hwnd, dpi);
+        layout_date_input(hwnd);
     }
 }
 
@@ -583,38 +584,29 @@ pub(super) unsafe fn create(
             SetWindowTheme(child, wide("DarkMode_CFD").as_ptr(), null());
         }
         if class == "COMBOBOX" {
-            SetWindowSubclass(child, Some(combo_proc), 1, dpi as _);
+            SetWindowSubclass(child, Some(combo_proc), 1, 0);
             SendMessageW(child, CB_SETITEMHEIGHT, 0, unit(24) as _);
             SendMessageW(child, CB_SETITEMHEIGHT, usize::MAX, unit(24) as _);
             SendMessageW(child, CB_SETMINVISIBLE, 8, 0);
         }
         if class == "SysDateTimePick32" {
             SendMessageW(child, DTM_SETMCFONT, font as usize, 0);
-            SetWindowSubclass(child, Some(date_proc), 1, dpi as _);
+            SetWindowSubclass(child, Some(date_proc), 1, 0);
             attach_date_input(child, font, dpi);
         }
         if class == "BUTTON" && (style & 0xf) == BS_AUTOCHECKBOX as u32 {
-            SetWindowSubclass(child, Some(check_proc), 1, dpi as _);
+            SetWindowSubclass(child, Some(check_proc), 1, 0);
         }
         if class == "EDIT" || class == "COMBOBOX" || class == "SysDateTimePick32" {
-            let mut bounds: RECT = zeroed();
-            GetWindowRect(child, &mut bounds);
-            let region = CreateRoundRectRgn(
-                0,
-                0,
-                bounds.right - bounds.left,
-                bounds.bottom - bounds.top,
-                unit(10),
-                unit(10),
-            );
-            SetWindowRgn(child, region, 1);
+            ultra_bar_native_ui::geometry::attach_rounded(child, 10);
         }
         child
     }
 }
 
-pub(super) unsafe fn paint_control(hwnd: HWND, dc: HDC, dpi: i32, kind: u8) {
+pub(super) unsafe fn paint_control(hwnd: HWND, dc: HDC, kind: u8) {
     unsafe {
+        let dpi = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(hwnd).max(96) as i32;
         let mut rect: RECT = zeroed();
         GetClientRect(hwnd, &mut rect);
         let unit = |n: i32| n * dpi / 96;
@@ -701,7 +693,8 @@ pub(super) unsafe fn paint_control(hwnd: HWND, dc: HDC, dpi: i32, kind: u8) {
                 },
             );
             let old_pen = SelectObject(dc, pen);
-            RoundRect(dc, 0, 0, rect.right, rect.bottom, unit(10), unit(10));
+            let corner = ultra_bar_native_ui::geometry::corner_pixels(hwnd);
+            RoundRect(dc, 0, 0, rect.right, rect.bottom, corner, corner);
             SelectObject(dc, old_pen);
             ultra_bar_native_ui::fonts::delete_object(pen);
             SelectObject(dc, old_brush);
@@ -769,7 +762,6 @@ pub(super) unsafe fn themed_control(
     w: WPARAM,
     l: LPARAM,
     id: usize,
-    dpi: usize,
     kind: u8,
 ) -> LRESULT {
     unsafe {
@@ -795,7 +787,7 @@ pub(super) unsafe fn themed_control(
             let mut rect: RECT = zeroed();
             GetClientRect(hwnd, &mut rect);
             if let Some(surface) = ultra_bar_native_ui::Surface::new(rect.right, rect.bottom) {
-                paint_control(hwnd, surface.dc, dpi as _, kind);
+                paint_control(hwnd, surface.dc, kind);
                 surface.blit_opaque(dc);
             }
             if message == WM_PAINT {
@@ -804,7 +796,7 @@ pub(super) unsafe fn themed_control(
             return 0;
         }
         if message == WM_PRINT || message == WM_PRINTCLIENT {
-            paint_control(hwnd, w as _, dpi as _, kind);
+            paint_control(hwnd, w as _, kind);
             return 0;
         }
         let result = DefSubclassProc(hwnd, message, w, l);
@@ -824,9 +816,9 @@ unsafe extern "system" fn check_proc(
     w: WPARAM,
     l: LPARAM,
     id: usize,
-    data: usize,
+    _data: usize,
 ) -> LRESULT {
-    unsafe { themed_control(hwnd, m, w, l, id, data, 0) }
+    unsafe { themed_control(hwnd, m, w, l, id, 0) }
 }
 
 unsafe extern "system" fn combo_proc(
@@ -835,9 +827,9 @@ unsafe extern "system" fn combo_proc(
     w: WPARAM,
     l: LPARAM,
     id: usize,
-    data: usize,
+    _data: usize,
 ) -> LRESULT {
-    unsafe { themed_control(hwnd, m, w, l, id, data, 1) }
+    unsafe { themed_control(hwnd, m, w, l, id, 1) }
 }
 
 unsafe extern "system" fn date_proc(
@@ -846,7 +838,7 @@ unsafe extern "system" fn date_proc(
     w: WPARAM,
     l: LPARAM,
     id: usize,
-    data: usize,
+    _data: usize,
 ) -> LRESULT {
     unsafe {
         if m == WM_COMMAND && l as HWND == date_input(hwnd) {
@@ -899,17 +891,17 @@ unsafe extern "system" fn date_proc(
                 wide("UltraBar.DateDropdownPress").as_ptr(),
                 1usize as _,
             );
-            let result = themed_control(hwnd, m, w, l, id, data, 2);
+            let result = themed_control(hwnd, m, w, l, id, 2);
             RemovePropW(hwnd, wide("UltraBar.DateDropdownPress").as_ptr());
-            layout_date_input(hwnd, data as i32);
+            layout_date_input(hwnd);
             return result;
         }
         if m == WM_NCDESTROY {
             RemovePropW(hwnd, wide(DATE_EDIT).as_ptr());
         }
-        let result = themed_control(hwnd, m, w, l, id, data, 2);
+        let result = themed_control(hwnd, m, w, l, id, 2);
         if m == WM_SIZE {
-            layout_date_input(hwnd, data as i32);
+            layout_date_input(hwnd);
             theme_time_children(hwnd);
         }
         if m == WM_PARENTNOTIFY && w as u16 == WM_CREATE as u16 {

@@ -446,11 +446,7 @@ unsafe fn position(state: &mut State) {
             height,
             SWP_NOACTIVATE,
         );
-        SetWindowRgn(
-            state.hwnd,
-            CreateRoundRectRgn(0, 0, width, height, unit(state, 18), unit(state, 18)),
-            1,
-        );
+        ultra_bar_native_ui::geometry::attach_rounded(state.hwnd, 18);
     }
 }
 unsafe fn choose(state: &mut State, index: usize) {
