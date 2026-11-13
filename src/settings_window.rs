@@ -26,6 +26,12 @@ pub struct Snapshot {
     pub pages: Vec<Vec<Row>>,
     pub plugins: Vec<crate::settings_editor::PluginPage>,
     pub clock_provider: Option<String>,
+    pub updates: std::collections::HashMap<String, PluginUpdate>,
+}
+pub struct PluginUpdate {
+    pub version: String,
+    pub source: String,
+    pub busy: bool,
 }
 struct State {
     owner: HWND,
@@ -41,6 +47,7 @@ struct State {
     editor: crate::settings_editor::Editor,
     nav_scroll: usize,
     tips: Option<Tooltips>,
+    pending_update: Option<String>,
 }
 pub struct Window {
     hwnd: HWND,
@@ -91,6 +98,7 @@ impl Window {
                 editor: Default::default(),
                 nav_scroll: 0,
                 tips: None,
+                pending_update: None,
             });
             let mut work: MONITORINFO = zeroed();
             work.cbSize = size_of::<MONITORINFO>() as _;
@@ -150,6 +158,14 @@ impl Window {
     }
     pub fn take_save(&mut self) -> Option<(String, u64, Vec<String>)> {
         self.state.editor.take_save()
+    }
+    pub fn take_update(&mut self) -> Option<String> {
+        self.state.pending_update.take()
+    }
+    pub fn take_action(
+        &mut self,
+    ) -> Option<(String, ultra_bar_native_ui::settings_bridge::SaveRequest)> {
+        self.state.editor.take_action()
     }
     pub fn has_unsaved(&self) -> bool {
         self.state.editor.has_unsaved()
@@ -256,7 +272,7 @@ fn choices(command: usize) -> &'static [(usize, &'static str)] {
     match command {
         2 | 3 => &[(3, "仅图标"), (2, "根据空间自动展示")],
         7 | 8 => &[(7, "正常"), (8, "小")],
-        17 => &[(50, "纯凹陷"), (51, "底部横条"), (52, "顶部黑点")],
+        17 => &[(50, "纯凹陷"), (51, "底部横条"), (52, "顶部粗点")],
         _ => &[],
     }
 }
@@ -267,7 +283,8 @@ unsafe fn sync_tips(s: &mut State) {
             bounds: (u(646), 0, u(700), u(58)),
             text: "关闭".into(),
         }];
-        if s.tab >= TABS.len() {
+        if s.tab >= TABS.len() && s.editor.has_form() {
+            tips.extend(s.editor.tips(s.dpi));
             tips.extend([
                 Tip {
                     bounds: (u(545), u(478), u(590), u(524)),
@@ -279,12 +296,41 @@ unsafe fn sync_tips(s: &mut State) {
                 },
             ]);
         }
+        if let Some(rows) = s.data.pages.get(s.tab) {
+            for (i, row) in rows.iter().skip(s.scroll).take(6).enumerate() {
+                if matches!(row.command, 70 | 71) {
+                    let y = 100 + i as i32 * 66;
+                    tips.push(Tip {
+                        bounds: (u(184), u(y), u(676), u(y + 58)),
+                        text: format!("{}\n{}", row.title, row.detail),
+                    });
+                }
+            }
+        }
         for (i, plugin) in s.data.plugins.iter().enumerate().skip(s.nav_scroll).take(5) {
             let y = 304 + (i - s.nav_scroll) as i32 * 42;
             tips.push(Tip {
-                bounds: (u(12), u(y), u(160), u(y + 38)),
+                bounds: (
+                    u(12),
+                    u(y),
+                    u(if s.data.updates.contains_key(&plugin.id) {
+                        124
+                    } else {
+                        160
+                    }),
+                    u(y + 38),
+                ),
                 text: plugin.name.clone(),
             });
+            if let Some(update) = s.data.updates.get(&plugin.id) {
+                tips.push(Tip {
+                    bounds: (u(124), u(y + 4), u(160), u(y + 34)),
+                    text: format!(
+                        "{}\n更新至 {}\n来源：{}",
+                        plugin.id, update.version, update.source
+                    ),
+                });
+            }
         }
         if let Some(control) = &mut s.tips {
             control.sync(tips);
@@ -345,6 +391,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                 }
                 if s.tab >= TABS.len() {
                     s.editor.scroll(hwnd, ((w >> 16) as i16) < 0, s.dpi);
+                    sync_tips(s);
                     return 0;
                 }
                 let count = s.data.pages.get(s.tab).map_or(0, Vec::len);
@@ -369,9 +416,20 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                 } else if x < 164 && (304..514).contains(&y) {
                     let index = s.nav_scroll + ((y - 304) / 42) as usize;
                     if let Some(plugin) = s.data.plugins.get(index) {
-                        s.tab = TABS.len() + index;
-                        s.editor
-                            .select(hwnd, Some(plugin.id.clone()), s.font, s.dpi);
+                        if (124..160).contains(&x)
+                            && (4..34).contains(&((y - 304) % 42))
+                            && s.data
+                                .updates
+                                .get(&plugin.id)
+                                .is_some_and(|update| !update.busy)
+                        {
+                            s.pending_update = Some(plugin.id.clone());
+                            PostMessageW(s.owner, message(), 73, 0);
+                        } else {
+                            s.tab = TABS.len() + index;
+                            s.editor
+                                .select(hwnd, Some(plugin.id.clone()), s.font, s.dpi);
+                        }
                     }
                 } else if s.tab >= TABS.len() {
                     if s.editor.click(hwnd, x, y, s.font, s.icons, s.dpi) {
@@ -401,6 +459,21 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                 s.editor.changed();
                 InvalidateRect(hwnd, null(), 0);
                 0
+            }
+            WM_COMMAND if (w >> 16) as u32 == CBN_SELCHANGE => {
+                s.editor.choice_changed(l as HWND);
+                InvalidateRect(hwnd, null(), 0);
+                0
+            }
+            WM_COMMAND if (w >> 16) as u32 == CBN_DROPDOWN => {
+                crate::editors::controls::prepare_combo_popup(l as HWND);
+                0
+            }
+            WM_DRAWITEM if l != 0 => {
+                crate::editors::controls::draw_combo_item(
+                    &*(l as *const windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT),
+                );
+                1
             }
             WM_CTLCOLOREDIT => {
                 SetBkColor(w as HDC, theme::palette().field);
@@ -500,7 +573,11 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                                 &plugin.name,
                                 24,
                                 y,
-                                132,
+                                if s.data.updates.contains_key(&plugin.id) {
+                                    96
+                                } else {
+                                    132
+                                },
                                 38,
                                 if s.tab == TABS.len() + i {
                                     palette.text
@@ -508,11 +585,61 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                                     palette.muted
                                 },
                             );
+                            if let Some(update) = s.data.updates.get(&plugin.id) {
+                                let brush = SelectObject(dc, theme::field_brush());
+                                RoundRect(
+                                    dc,
+                                    unit(128),
+                                    unit(y + 5),
+                                    unit(156),
+                                    unit(y + 33),
+                                    unit(8),
+                                    unit(8),
+                                );
+                                SelectObject(dc, brush);
+                                SelectObject(dc, s.icons);
+                                text(
+                                    "\u{e896}",
+                                    130,
+                                    y + 5,
+                                    24,
+                                    28,
+                                    if update.busy {
+                                        palette.muted
+                                    } else {
+                                        palette.active_border
+                                    },
+                                );
+                                SelectObject(dc, s.plugin_font);
+                            }
                         }
                         SelectObject(dc, s.font);
                     }
                     if s.tab >= TABS.len() {
-                        s.editor.draw(&surface, s.dpi, s.font, s.icons);
+                        if let Some(page) = s.data.plugins.get(s.tab - TABS.len())
+                            && page.schema.is_none()
+                            && let Some(update) = s.data.updates.get(&page.id)
+                        {
+                            text(
+                                &format!("可更新至 {}", update.version),
+                                200,
+                                110,
+                                460,
+                                28,
+                                palette.text,
+                            );
+                            text(&page.id, 200, 150, 460, 28, palette.muted);
+                            text(
+                                &format!("来源：{}", update.source),
+                                200,
+                                190,
+                                460,
+                                28,
+                                palette.muted,
+                            );
+                        } else {
+                            s.editor.draw(&surface, s.dpi, s.font, s.icons);
+                        }
                     }
                     if s.tab == 2
                         && let Some(provider) = &s.data.clock_provider
@@ -600,7 +727,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                             } else {
                                 text(&row.detail, 200, y + 29, 420, 20, palette.muted);
                             }
-                            if matches!(row.command, 41 | 42) {
+                            if matches!(row.command, 41 | 42 | 72) {
                                 ultra_bar_native_ui::form::draw_switch(
                                     dc,
                                     RECT {

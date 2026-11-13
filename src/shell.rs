@@ -149,6 +149,10 @@ struct State {
     host: Option<Host>,
     hub: Option<crate::plugin_system::Hub>,
     settings_window: Option<crate::settings_window::Window>,
+    updates: crate::updates::Updates,
+    update_prompted: Option<String>,
+    update_prompt_open: bool,
+    installer_started: Option<std::path::PathBuf>,
     development_plugins: std::path::PathBuf,
     inventory_message: u32,
     tray_host: Option<tray::Host>,
@@ -294,6 +298,13 @@ pub fn run(options: Options) -> Result<()> {
             host: None,
             hub: None,
             settings_window: None,
+            updates: crate::updates::Updates::new(
+                crate::plugin_system::model::Paths::user()?,
+                initial_settings.auto_check_updates && !options.isolated,
+            ),
+            update_prompted: None,
+            update_prompt_open: false,
+            installer_started: None,
             development_plugins: options.plugins.clone(),
             inventory_message: RegisterWindowMessageW(
                 wide(crate::plugin_system::model::INVENTORY_MESSAGE).as_ptr(),
@@ -2185,6 +2196,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             m if m == state.inventory_message => {
+                state.updates.inventory_changed();
                 if let Some(host) = &state.host {
                     host.refresh();
                 }
@@ -2222,6 +2234,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
             WM_TIMER => {
                 if w == 1 {
                     refresh_fullscreen(state);
+                    if state.updates.poll() {
+                        refresh_settings(state);
+                    }
+                    poll_updates(state);
                 }
                 if w == tray::HOVER_TIMER {
                     KillTimer(hwnd, tray::HOVER_TIMER);
@@ -2818,7 +2834,14 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_CLOSE => {
-                if state.editors.busy() {
+                if state.editors.busy()
+                    || state
+                        .settings_window
+                        .as_ref()
+                        .is_some_and(|w| w.has_unsaved())
+                    || state.hub.as_ref().is_some_and(|hub| hub.busy())
+                    || crate::lifecycle::modal_open(hwnd)
+                {
                     return 0;
                 }
                 DestroyWindow(hwnd);
@@ -2972,12 +2995,12 @@ unsafe fn paint(state: &mut State) {
                 None
             };
             let highlighted = group.is_some_and(|task| !task.windows.is_empty() || task.attention);
+            let active = group.is_some_and(|task| {
+                state.preview_active == Some(task.id)
+                    || (!foreground.is_null()
+                        && task.windows.iter().any(|window| window.hwnd == foreground))
+            });
             if highlighted {
-                let active = group.is_some_and(|task| {
-                    state.preview_active == Some(task.id)
-                        || (!foreground.is_null()
-                            && task.windows.iter().any(|window| window.hwnd == foreground))
-                });
                 task_background(
                     &surface,
                     &rect,
@@ -3010,26 +3033,34 @@ unsafe fn paint(state: &mut State) {
                     ultra_bar_native_ui::fonts::delete_object(brush);
                 }
             }
+            let content = if group.is_some() {
+                crate::task_relief::content_rect(&rect, state.dpi, active, state.settings.active_style)
+            } else {
+                rect
+            };
             let mut text_rect = RECT {
-                left: rect.left + padding,
-                right: rect.right - padding,
-                ..rect
+                left: content.left + padding,
+                right: content.right - padding,
+                ..content
             };
             match icon {
                 ButtonIcon::Windows => {
                     surface.windows_logo(&rect, state.dpi, state.win11, state.settings.size.logo())
                 }
                 ButtonIcon::Application(handle) => {
-                    let size = unit(state.settings.size.icon());
-                    let icon_left = if text.is_empty() {
-                        (rect.left + rect.right - size) / 2
-                    } else {
-                        rect.left + padding
-                    };
+                    let icon_bounds = crate::task_relief::icon_rect(
+                        &content,
+                        unit(state.settings.size.icon()),
+                        state.dpi,
+                        !text.is_empty(),
+                        padding,
+                    );
+                    let size = icon_bounds.right - icon_bounds.left;
+                    let icon_left = icon_bounds.left;
                     DrawIconEx(
                         buffer,
                         icon_left,
-                        (height - size) / 2,
+                        icon_bounds.top,
                         handle,
                         size,
                         size,
@@ -3045,9 +3076,9 @@ unsafe fn paint(state: &mut State) {
                             &rect,
                             &RECT {
                                 left: icon_left,
-                                top: (height - size) / 2,
+                                top: icon_bounds.top,
                                 right: icon_left + size,
-                                bottom: (height + size) / 2,
+                                bottom: icon_bounds.bottom,
                             },
                             group.windows.len(),
                             state.dpi,
@@ -3494,6 +3525,12 @@ unsafe fn smoke_taskbar(state: &mut State, directory: &std::path::Path) -> Resul
         }
 
         std::fs::create_dir_all(directory)?;
+        if let Some(path) = std::env::var_os("ULTRA_BAR_UPDATES_FIXTURE") {
+            anyhow::ensure!(state.isolated, "更新预览必须使用隔离模式");
+            let bytes = std::fs::read(path)?;
+            anyhow::ensure!(bytes.len() <= 1024 * 1024, "更新预览数据过大");
+            state.updates.snapshot = Arc::new(serde_json::from_slice(&bytes)?);
+        }
         let mut snapshot = settings_snapshot(state);
         if let Some(path) = std::env::var_os("ULTRA_BAR_SETTINGS_FIXTURE") {
             snapshot.plugins = serde_json::from_slice(&std::fs::read(path)?)?;
@@ -4232,7 +4269,7 @@ fn settings_snapshot(state: &State) -> crate::settings_window::Snapshot {
         plugin_id: None,
     };
     let root = crate::data_paths::root().ok();
-    let plugins = state
+    let mut plugins: Vec<crate::settings_editor::PluginPage> = state
         .widgets
         .iter()
         .filter(|w| w.panel.is_some())
@@ -4244,13 +4281,64 @@ fn settings_snapshot(state: &State) -> crate::settings_window::Snapshot {
             }),
         })
         .collect();
+    let mut extra: Vec<_> = state
+        .updates
+        .snapshot
+        .plugins
+        .values()
+        .filter(|candidate| !plugins.iter().any(|page| page.id == candidate.entry.id))
+        .collect();
+    extra.sort_by(|a, b| a.entry.id.cmp(&b.entry.id));
+    plugins.extend(
+        extra
+            .into_iter()
+            .map(|candidate| crate::settings_editor::PluginPage {
+                id: candidate.entry.id.clone(),
+                name: candidate.entry.name.clone(),
+                schema: None,
+            }),
+    );
     let clock_provider = selected_clock_provider(&state.widgets, &state.settings.clock_extension)
         .map(|widget| widget.name.clone());
     let mut snapshot = Snapshot {
         clock_provider,
         plugins,
+        updates: state
+            .updates
+            .snapshot
+            .plugins
+            .iter()
+            .map(|(id, c)| {
+                (
+                    id.clone(),
+                    crate::settings_window::PluginUpdate {
+                        version: c.entry.version.clone(),
+                        source: format!("{} ({})", c.source.name, c.source.full_name),
+                        busy: state.updates.snapshot.busy.is_some(),
+                    },
+                )
+            })
+            .collect(),
         pages: vec![
             vec![
+                row(
+                    72,
+                    "自动检查更新",
+                    if state.settings.auto_check_updates {
+                        "开启"
+                    } else {
+                        "关闭"
+                    },
+                ),
+                row(
+                    70,
+                    "版本更新",
+                    &format!(
+                        "v{} · {}",
+                        env!("CARGO_PKG_VERSION"),
+                        state.updates.snapshot.status
+                    ),
+                ),
                 row(
                     41,
                     "开机启动",
@@ -4343,6 +4431,16 @@ fn settings_snapshot(state: &State) -> crate::settings_window::Snapshot {
     if snapshot.clock_provider.is_some() {
         snapshot.pages[2].clear();
     }
+    if let Some(release) = &state.updates.snapshot.main {
+        snapshot.pages[0].insert(
+            2,
+            row(
+                71,
+                "下载安装新版",
+                &format!("Ultra Bar {}", release.version),
+            ),
+        );
+    }
     snapshot
 }
 unsafe fn refresh_settings(state: &mut State) {
@@ -4366,6 +4464,73 @@ unsafe fn show_settings(state: &mut State) {
         }
     }
 }
+unsafe fn updates_busy(state: &State) -> bool {
+    state.editors.busy()
+        || state.fullscreen_hidden
+        || state.hub.as_ref().is_some_and(|hub| hub.busy())
+        || unsafe { crate::lifecycle::modal_open(state.hwnd) }
+        || state
+            .settings_window
+            .as_ref()
+            .is_some_and(|w| w.has_unsaved())
+}
+unsafe fn poll_updates(state: &mut State) {
+    unsafe {
+        if state.updates.snapshot.main.is_none() && state.updates.snapshot.installer.is_none() {
+            return;
+        }
+        if state.isolated
+            || state.update_prompt_open
+            || state.updates.snapshot.busy.is_some()
+            || updates_busy(state)
+        {
+            return;
+        }
+        if let Some(path) = state.updates.snapshot.installer.clone()
+            && state.installer_started.as_ref() != Some(&path)
+        {
+            let result = ShellExecuteW(
+                state.hwnd,
+                wide("open").as_ptr(),
+                wide(&path.to_string_lossy()).as_ptr(),
+                null(),
+                null(),
+                SW_SHOWNORMAL,
+            );
+            if result as usize > 32 {
+                state.installer_started = Some(path);
+                state.updates.installer_started();
+                PostMessageW(state.hwnd, crate::lifecycle::exit_message(), 0, 0);
+            } else {
+                state.installer_started = Some(path);
+                crate::visual::diagnostics::event(
+                    "updates",
+                    "installer.launch_failed",
+                    serde_json::json!({"code":result as usize}),
+                );
+            }
+        }
+        if state.settings.auto_check_updates
+            && state.installer_started.is_none()
+            && let Some(release) = state.updates.snapshot.main.clone()
+            && state.update_prompted.as_ref() != Some(&release.version)
+        {
+            state.update_prompted = Some(release.version.clone());
+            state.update_prompt_open = true;
+            let accepted = visual::dialog::confirm(
+                state.hwnd,
+                "Ultra Bar 更新",
+                &format!("发现新版本 {}，是否下载安装？", release.version),
+                "下载安装",
+            );
+            state.update_prompt_open = false;
+            if accepted {
+                state.installer_started = None;
+                state.updates.download_main(release);
+            }
+        }
+    }
+}
 unsafe fn settings_action(state: &mut State, result: usize) {
     ultra_bar_native_ui::diagnostics::event(
         "settings",
@@ -4373,6 +4538,85 @@ unsafe fn settings_action(state: &mut State, result: usize) {
         serde_json::json!({"command":result}),
     );
     unsafe {
+        if result == 0 {
+            show_settings(state);
+            return;
+        }
+        if result == 70 {
+            state.updates.check();
+            refresh_settings(state);
+            return;
+        }
+        if result == 71 {
+            if !updates_busy(state)
+                && state.updates.snapshot.busy.is_none()
+                && let Some(release) = state.updates.snapshot.main.clone()
+            {
+                state.installer_started = None;
+                state.update_prompted = state
+                    .updates
+                    .snapshot
+                    .main
+                    .as_ref()
+                    .map(|r| r.version.clone());
+                state.updates.download_main(release);
+                refresh_settings(state);
+            } else if updates_busy(state) {
+                visual::dialog::confirm(
+                    state.hwnd,
+                    "暂不能安装更新",
+                    "请先保存编辑内容或完成当前操作，再重试。",
+                    "知道了",
+                );
+            }
+            return;
+        }
+        if result == 72 {
+            let mut next = state.settings.clone();
+            next.auto_check_updates = !next.auto_check_updates;
+            match next.save() {
+                Ok(()) => {
+                    state.settings = next;
+                    state.updates.enabled(state.settings.auto_check_updates);
+                    refresh_settings(state);
+                }
+                Err(error) => app_error(state.hwnd, &error),
+            };
+            return;
+        }
+        if result == 73 {
+            let pending_update = state.settings_window.as_mut().and_then(|w| w.take_update());
+            if updates_busy(state) {
+                visual::dialog::confirm(
+                    state.hwnd,
+                    "暂不能更新插件",
+                    "请先保存编辑内容或完成当前操作，再重试。",
+                    "知道了",
+                );
+                return;
+            }
+            if let Some(id) = pending_update
+                && !updates_busy(state)
+                && let Some(candidate) = state.updates.snapshot.plugins.get(&id).cloned()
+            {
+                state.update_prompt_open = true;
+                let accepted = visual::dialog::confirm(
+                    state.hwnd,
+                    "更新插件",
+                    &format!(
+                        "{} → {}\n来源：{}",
+                        candidate.entry.name, candidate.entry.version, candidate.source.full_name
+                    ),
+                    "更新",
+                );
+                state.update_prompt_open = false;
+                if accepted {
+                    state.updates.plugin(candidate);
+                    refresh_settings(state);
+                }
+            }
+            return;
+        }
         let hwnd = state
             .settings_window
             .as_ref()
@@ -4412,6 +4656,25 @@ unsafe fn settings_action(state: &mut State, result: usize) {
             return;
         }
         if result == 90 {
+            if let Some((id, request)) =
+                state.settings_window.as_mut().and_then(|w| w.take_action())
+            {
+                let outcome = state
+                    .widgets
+                    .iter()
+                    .find(|widget| widget.id == id)
+                    .context("插件已卸载")
+                    .and_then(|widget| {
+                        crate::plugin_panels::settings_request(widget, state.hwnd, request)
+                    });
+                if let Err(error) = outcome
+                    && let Some(window) = &mut state.settings_window
+                {
+                    window.save_error(&id, error.to_string());
+                }
+                refresh_settings(state);
+                return;
+            }
             if let Some((id, revision, values)) =
                 state.settings_window.as_mut().and_then(|w| w.take_save())
             {

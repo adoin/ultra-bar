@@ -15,7 +15,7 @@ struct Repository {
     full_name: String,
     name: String,
 }
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Asset {
     id: u64,
     name: String,
@@ -23,6 +23,206 @@ struct Asset {
     browser_download_url: String,
     #[serde(default)]
     digest: Option<String>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AppRelease {
+    pub version: String,
+    pub tag: String,
+    installer: Asset,
+    checksum: Asset,
+}
+pub const APP_REPOSITORY_ID: u64 = 1452115414;
+fn app_source() -> Result<Source> {
+    let source = Source {
+        id: format!("github:{APP_REPOSITORY_ID}"),
+        full_name: "adoin/ultra-bar".into(),
+        name: "Ultra Bar".into(),
+    };
+    let repo = by_id(&source)?;
+    Ok(Source {
+        full_name: repo.full_name,
+        ..source
+    })
+}
+fn app_release(release: Release) -> Result<AppRelease> {
+    ensure!(!release.draft && !release.prerelease, "不使用预览版本更新");
+    let version = release
+        .tag_name
+        .strip_prefix('v')
+        .context("本体发布标签无效")?;
+    let parsed = semver::Version::parse(version)?;
+    ensure!(
+        parsed.pre.is_empty() && parsed.build.is_empty(),
+        "安装包版本必须为稳定版本"
+    );
+    let name = format!("UltraBar-{version}-windows-x86_64-setup.exe");
+    let installer = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == name)
+        .context("新版安装包尚未就绪")?
+        .clone();
+    let checksum = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == format!("{name}.sha256"))
+        .context("新版安装包缺少校验文件")?
+        .clone();
+    ensure!(
+        installer.size > 0
+            && installer.size <= 256 * 1024 * 1024
+            && checksum.size > 0
+            && checksum.size <= 4096,
+        "安装包产物信息无效"
+    );
+    Ok(AppRelease {
+        version: version.into(),
+        tag: release.tag_name,
+        installer,
+        checksum,
+    })
+}
+pub fn latest_app() -> Result<AppRelease> {
+    let source = app_source()?;
+    app_release(serde_json::from_slice(&request(
+        &format!("repos/{}/releases/latest", source.full_name),
+        false,
+        2 * 1024 * 1024,
+    )?)?)
+}
+pub fn download_app(
+    release: &AppRelease,
+    directory: &std::path::Path,
+) -> Result<std::path::PathBuf> {
+    let source = app_source()?;
+    ensure!(
+        release.tag == format!("v{}", semver::Version::parse(&release.version)?),
+        "更新版本无效"
+    );
+    let fresh = app_release(serde_json::from_slice(&request(
+        &format!("repos/{}/releases/tags/{}", source.full_name, release.tag),
+        false,
+        2 * 1024 * 1024,
+    )?)?)?;
+    ensure!(
+        fresh.version == release.version && fresh.installer.id == release.installer.id,
+        "发布产物已变更，请重新检查更新"
+    );
+    let checksum = String::from_utf8(asset_bytes(&source, &fresh.checksum, 4096)?)?;
+    let parts: Vec<_> = checksum.split_whitespace().collect();
+    ensure!(
+        parts.len() == 2
+            && parts[0].len() == 64
+            && parts[0].bytes().all(|c| c.is_ascii_hexdigit())
+            && parts[1] == fresh.installer.name,
+        "安装包校验文件无效"
+    );
+    std::fs::create_dir_all(directory)?;
+    let file = directory.join(&fresh.installer.name);
+    if file.exists()
+        && std::fs::metadata(&file)?.len() == fresh.installer.size
+        && sha256(&std::fs::read(&file)?).eq_ignore_ascii_case(parts[0])
+    {
+        verify_installer(&file, &fresh.version)?;
+        return Ok(file);
+    }
+    let bytes = asset_bytes(&source, &fresh.installer, 256 * 1024 * 1024)?;
+    let hash = sha256(&bytes);
+    ensure!(hash.eq_ignore_ascii_case(parts[0]), "安装包 SHA-256 不一致");
+    if let Some(digest) = &fresh.installer.digest {
+        ensure!(
+            digest.eq_ignore_ascii_case(&format!("sha256:{hash}")),
+            "GitHub 安装包摘要不一致"
+        );
+    }
+    let file = write_download(directory, &fresh.installer.name, &bytes)?;
+    verify_installer(&file, &fresh.version)?;
+    Ok(file)
+}
+pub fn verify_installer(path: &std::path::Path, version: &str) -> Result<()> {
+    use std::ptr::{null_mut, read_unaligned};
+    use windows_sys::Win32::Storage::FileSystem::*;
+    let expected = semver::Version::parse(version)?;
+    ensure!(
+        expected.major <= 65535 && expected.minor <= 65535 && expected.patch <= 65535,
+        "安装包版本范围无效"
+    );
+    unsafe {
+        let name = crate::visual::wide(&path.to_string_lossy());
+        let mut handle = 0;
+        let size = GetFileVersionInfoSizeW(name.as_ptr(), &mut handle);
+        ensure!(size > 0 && size <= 4 * 1024 * 1024, "安装包版本资源无效");
+        let mut bytes = vec![0u8; size as usize];
+        ensure!(
+            GetFileVersionInfoW(name.as_ptr(), 0, size, bytes.as_mut_ptr().cast()) != 0,
+            "无法读取安装包版本"
+        );
+        let mut pointer = null_mut();
+        let mut length = 0;
+        ensure!(
+            VerQueryValueW(
+                bytes.as_ptr().cast(),
+                crate::visual::wide("\\").as_ptr(),
+                &mut pointer,
+                &mut length
+            ) != 0
+                && !pointer.is_null()
+                && length as usize >= std::mem::size_of::<VS_FIXEDFILEINFO>(),
+            "安装包版本信息缺失"
+        );
+        let info = read_unaligned(pointer as *const VS_FIXEDFILEINFO);
+        ensure!(
+            info.dwSignature == 0xfeef04bd
+                && info.dwProductVersionMS >> 16 == expected.major as u32
+                && info.dwProductVersionMS & 0xffff == expected.minor as u32
+                && info.dwProductVersionLS >> 16 == expected.patch as u32
+                && info.dwProductVersionLS & 0xffff == 0,
+            "安装包资源版本不匹配"
+        );
+        ensure!(
+            VerQueryValueW(
+                bytes.as_ptr().cast(),
+                crate::visual::wide("\\VarFileInfo\\Translation").as_ptr(),
+                &mut pointer,
+                &mut length
+            ) != 0
+                && length >= 4,
+            "安装包身份信息缺失"
+        );
+        let mut valid = false;
+        for index in 0..length as usize / 4 {
+            let word = pointer as *const u16;
+            let language = read_unaligned(word.add(index * 2));
+            let page = read_unaligned(word.add(index * 2 + 1));
+            let mut values = Vec::new();
+            for field in ["ProductName", "FileDescription"] {
+                let mut value = null_mut();
+                let mut count = 0;
+                let query = crate::visual::wide(&format!(
+                    "\\StringFileInfo\\{language:04x}{page:04x}\\{field}"
+                ));
+                if VerQueryValueW(
+                    bytes.as_ptr().cast(),
+                    query.as_ptr(),
+                    &mut value,
+                    &mut count,
+                ) == 0
+                    || value.is_null()
+                    || count > size / 2
+                {
+                    continue;
+                }
+                let text: Vec<u16> = (0..count as usize)
+                    .map(|i| read_unaligned((value as *const u16).add(i)))
+                    .take_while(|c| *c != 0)
+                    .collect();
+                values.push(String::from_utf16_lossy(&text).trim().to_owned());
+            }
+            valid |= values == ["Ultra Bar", "Ultra Bar Setup"];
+        }
+        ensure!(valid, "安装包不是 Ultra Bar 正式安装程序");
+    }
+    Ok(())
 }
 #[derive(Deserialize)]
 struct Release {
@@ -59,11 +259,26 @@ fn collect_market(source: &Source, catalog: MarketCatalog) -> Result<Vec<Candida
         ensure!(ids.insert(item.entry.id.clone()), "市场目录包含重复插件 ID");
         let tag = format!("{}/v{}", item.entry.id, item.entry.version);
         ensure!(item.release_tag == tag, "插件发布标签与版本不一致");
-        let base = format!("https://github.com/{}/releases/download/", source.full_name);
+        let rest = item
+            .download_url
+            .strip_prefix("https://github.com/")
+            .context("插件下载地址不是 GitHub HTTPS 地址")?;
+        let mut parts = rest.splitn(3, '/');
+        let repository = format!(
+            "{}/{}",
+            parts.next().unwrap_or_default(),
+            parts.next().unwrap_or_default()
+        );
+        repository_name(&repository)?;
+        let tail = parts.next().unwrap_or_default();
         ensure!(
-            item.download_url == format!("{base}{tag}/{}", item.entry.asset)
-                || item.download_url
-                    == format!("{base}{}/{}", tag.replace('/', "%2F"), item.entry.asset),
+            tail == format!("releases/download/{tag}/{}", item.entry.asset)
+                || tail
+                    == format!(
+                        "releases/download/{}/{}",
+                        tag.replace('/', "%2F"),
+                        item.entry.asset
+                    ),
             "插件下载地址与仓库、版本不一致"
         );
         ensure!(
@@ -91,6 +306,37 @@ fn collect_market(source: &Source, catalog: MarketCatalog) -> Result<Vec<Candida
 struct Cache {
     at: u64,
     entries: Vec<Candidate>,
+    #[serde(default)]
+    host_version: String,
+}
+fn cache_fresh(cache: &Cache, now: u64) -> bool {
+    cache.host_version == env!("CARGO_PKG_VERSION")
+        && now.checked_sub(cache.at).is_some_and(|age| age < 900)
+}
+static CACHE_WRITE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+fn write_download(
+    directory: &std::path::Path,
+    name: &str,
+    bytes: &[u8],
+) -> Result<std::path::PathBuf> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::fs::create_dir_all(directory)?;
+    let file = directory.join(name);
+    let pending = directory.join(format!(
+        ".{name}.{}.{}.partial",
+        std::process::id(),
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let result = (|| -> Result<()> {
+        std::fs::write(&pending, bytes)?;
+        std::fs::rename(&pending, &file)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&pending);
+    }
+    result?;
+    Ok(file)
 }
 
 fn request(endpoint: &str, binary: bool, limit: usize) -> Result<Vec<u8>> {
@@ -183,7 +429,7 @@ pub fn catalog(paths: &Paths, source: &Source, force: bool) -> Result<Vec<Candid
     if !force
         && file.exists()
         && let Ok(cache) = serde_json::from_slice::<Cache>(&std::fs::read(&file)?)
-        && now.saturating_sub(cache.at) < 900
+        && cache_fresh(&cache, now)
     {
         return Ok(cache.entries);
     }
@@ -234,12 +480,16 @@ pub fn catalog(paths: &Paths, source: &Source, force: bool) -> Result<Vec<Candid
             Ok(serde_json::from_slice::<Catalog>(&bytes)?)
         })?
     };
+    let _guard = CACHE_WRITE
+        .lock()
+        .map_err(|_| anyhow::anyhow!("更新目录缓存暂不可用"))?;
     let pending = file.with_extension("json.new");
     std::fs::write(
         &pending,
         serde_json::to_vec(&Cache {
             at: now,
             entries: entries.clone(),
+            host_version: env!("CARGO_PKG_VERSION").into(),
         })?,
     )?;
     std::fs::rename(pending, file)?;
@@ -375,19 +625,33 @@ fn asset_bytes(source: &Source, asset: &Asset, limit: usize) -> Result<Vec<u8>> 
 pub fn download(candidate: &Candidate, paths: &Paths) -> Result<std::path::PathBuf> {
     candidate.entry.validate()?;
     ensure!(
-        candidate.download_url.starts_with(&format!(
-            "https://github.com/{}/releases/download/",
-            candidate.source.full_name
-        )),
-        "发布下载地址不属于此仓库"
+        by_id(&candidate.source)?
+            .full_name
+            .eq_ignore_ascii_case(&candidate.source.full_name),
+        "插件仓库地址已变化，请重新检查更新"
     );
-    let asset = Asset {
-        id: candidate.asset_id,
-        name: candidate.entry.asset.clone(),
-        size: candidate.size,
-        browser_download_url: candidate.download_url.clone(),
-        digest: None,
-    };
+    // Asset IDs remain valid when a repository is renamed. Resolve the asset
+    // through that repository again rather than executing a stale catalog URL.
+    let asset: Asset = serde_json::from_slice(&request(
+        &format!(
+            "repos/{}/releases/assets/{}",
+            candidate.source.full_name, candidate.asset_id
+        ),
+        false,
+        2 * 1024 * 1024,
+    )?)?;
+    ensure!(
+        asset.id == candidate.asset_id
+            && asset.name == candidate.entry.asset
+            && asset.size == candidate.size,
+        "插件产物信息已变化，请重新检查"
+    );
+    if let Some(digest) = &asset.digest {
+        ensure!(
+            digest.eq_ignore_ascii_case(&format!("sha256:{}", candidate.entry.sha256)),
+            "GitHub 插件摘要与目录不一致"
+        );
+    }
     let bytes = asset_bytes(&candidate.source, &asset, 256 * 1024 * 1024)?;
     ensure!(
         sha256(&bytes).eq_ignore_ascii_case(&candidate.entry.sha256),
@@ -395,12 +659,11 @@ pub fn download(candidate: &Candidate, paths: &Paths) -> Result<std::path::PathB
     );
     let directory = paths.root.join("downloads");
     std::fs::create_dir_all(&directory)?;
-    let path = directory.join(format!(
-        "{}.ubplugin",
-        candidate.entry.sha256.to_lowercase()
-    ));
-    std::fs::write(&path, bytes)?;
-    Ok(path)
+    write_download(
+        &directory,
+        &format!("{}.ubplugin", candidate.entry.sha256.to_lowercase()),
+        &bytes,
+    )
 }
 
 fn http(url: &str, limit: usize) -> Result<Vec<u8>> {
@@ -508,6 +771,75 @@ fn http(url: &str, limit: usize) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn catalog_cache_expires_after_host_changes_or_clock_rollback() {
+        let mut cache = Cache {
+            at: 1000,
+            entries: vec![],
+            host_version: env!("CARGO_PKG_VERSION").into(),
+        };
+        assert!(cache_fresh(&cache, 1100));
+        assert!(!cache_fresh(&cache, 999));
+        assert!(!cache_fresh(&cache, 1900));
+        cache.host_version = "0.0.0".into();
+        assert!(!cache_fresh(&cache, 1100));
+    }
+    #[test]
+    fn app_release_requires_a_stable_tag_matching_installer_and_checksum() {
+        let release = serde_json::json!({"tag_name":"v2.0.0","draft":false,"prerelease":false,"assets":[{"id":1,"name":"UltraBar-2.0.0-windows-x86_64-setup.exe","size":100,"browser_download_url":"https://github.com/adoin/ultra-bar/releases/download/v2.0.0/setup.exe"},{"id":2,"name":"UltraBar-2.0.0-windows-x86_64-setup.exe.sha256","size":100,"browser_download_url":"https://github.com/adoin/ultra-bar/releases/download/v2.0.0/setup.exe.sha256"}]});
+        assert_eq!(
+            app_release(serde_json::from_value(release.clone()).unwrap())
+                .unwrap()
+                .version,
+            "2.0.0"
+        );
+        for (key, value) in [
+            ("draft", serde_json::json!(true)),
+            ("prerelease", serde_json::json!(true)),
+            ("tag_name", serde_json::json!("v2.0.0-rc.1")),
+        ] {
+            let mut bad = release.clone();
+            bad[key] = value;
+            assert!(app_release(serde_json::from_value(bad).unwrap()).is_err());
+        }
+        let mut missing = release.clone();
+        missing["assets"].as_array_mut().unwrap().pop();
+        assert!(app_release(serde_json::from_value(missing).unwrap()).is_err());
+    }
+    #[test]
+    fn installer_validation_rejects_an_application_binary() {
+        assert!(
+            verify_installer(&std::env::current_exe().unwrap(), env!("CARGO_PKG_VERSION")).is_err()
+        );
+    }
+    #[test]
+    fn concurrent_downloads_publish_complete_files_without_partial_debris() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = std::path::PathBuf::from(format!(
+            "D:/tmp/ultra-bar-update-tests/{}-{nonce}",
+            std::process::id()
+        ));
+        let first = directory.clone();
+        let second = directory.clone();
+        let a = std::thread::spawn(move || {
+            write_download(&first, "verified.ubplugin", b"verified complete bytes")
+        });
+        let b = std::thread::spawn(move || {
+            write_download(&second, "verified.ubplugin", b"verified complete bytes")
+        });
+        a.join().unwrap().unwrap();
+        b.join().unwrap().unwrap();
+        assert_eq!(
+            std::fs::read(directory.join("verified.ubplugin")).unwrap(),
+            b"verified complete bytes"
+        );
+        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
+        std::fs::remove_file(directory.join("verified.ubplugin")).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+    }
     fn market_fixture() -> serde_json::Value {
         serde_json::json!({"schema_version":2,"repository_id":1452116417,"plugins":[{
             "id":"com.example.calendar","name":"Calendar","version":"1.0.0","platform":PLATFORM,

@@ -369,7 +369,7 @@ pub(super) unsafe fn opaque_popup(hwnd: HWND) {
     }
 }
 
-pub(super) unsafe fn prepare_combo_popup(combo: HWND) {
+pub(crate) unsafe fn prepare_combo_popup(combo: HWND) {
     unsafe {
         let mut info: COMBOBOXINFO = zeroed();
         info.cbSize = size_of::<COMBOBOXINFO>() as _;
@@ -381,7 +381,7 @@ pub(super) unsafe fn prepare_combo_popup(combo: HWND) {
     }
 }
 
-pub(super) unsafe fn draw_combo_item(item: &DRAWITEMSTRUCT) {
+pub(crate) unsafe fn draw_combo_item(item: &DRAWITEMSTRUCT) {
     unsafe {
         let mut r = item.rcItem;
         let brush = if item.itemState & ODS_SELECTED != 0 {
@@ -519,7 +519,7 @@ pub(super) unsafe fn control_color(message: u32, w: WPARAM, l: LPARAM) -> LRESUL
     }
 }
 
-pub(super) unsafe fn create(
+pub(crate) unsafe fn create(
     parent: HWND,
     class: &str,
     label: &str,
@@ -844,7 +844,13 @@ unsafe extern "system" fn combo_proc(
     id: usize,
     _data: usize,
 ) -> LRESULT {
-    unsafe { themed_control(hwnd, m, w, l, id, 1) }
+    unsafe {
+        if m == WM_MOUSEWHEEL && SendMessageW(hwnd, CB_GETDROPPEDSTATE, 0, 0) == 0 {
+            SendMessageW(GetParent(hwnd), m, w, l);
+            return 0;
+        }
+        themed_control(hwnd, m, w, l, id, 1)
+    }
 }
 
 unsafe extern "system" fn date_proc(

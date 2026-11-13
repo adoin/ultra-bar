@@ -54,6 +54,8 @@ struct Panel {
 #[serde(deny_unknown_fields)]
 struct Manifest {
     id: String,
+    #[serde(default)]
+    host: Option<String>,
     #[serde(default = "default_version")]
     version: String,
     api_version: u32,
@@ -362,6 +364,12 @@ fn read_small(path: &Path) -> Result<String> {
 
 fn load(dir: &Path) -> Result<Plugin> {
     let manifest: Manifest = serde_json::from_str(&read_small(&dir.join("plugin.json"))?)?;
+    if let Some(requirement) = &manifest.host {
+        let requirement = semver::VersionReq::parse(requirement)?;
+        if !requirement.matches(&semver::Version::parse(env!("CARGO_PKG_VERSION"))?) {
+            bail!("plugin requires a different Ultra Bar version");
+        }
+    }
     if ![API_VERSION, 2, 3].contains(&manifest.api_version)
         || !(if manifest.api_version == 3 { 16 } else { 64 }..=320).contains(&manifest.width)
         || !(crate::plugin_system::model::valid_id(&manifest.id)
@@ -444,6 +452,17 @@ pub(crate) fn validate_directory(root: &Path) -> Result<Widget> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn manifest_host_requirement_is_optional_and_validated_before_loading_code() {
+        let base = r#"{"id":"com.example.test","version":"1.0.0","api_version":1,"entry":"main.rn","width":64}"#;
+        let manifest: Manifest = serde_json::from_str(base).unwrap();
+        assert!(manifest.host.is_none());
+        let with_host = base.replacen("{", r#"{"host":">=1.2.0,<2.0.0","#, 1);
+        let manifest: Manifest = serde_json::from_str(&with_host).unwrap();
+        let range = semver::VersionReq::parse(manifest.host.as_ref().unwrap()).unwrap();
+        assert!(range.matches(&semver::Version::new(1, 2, 0)));
+        assert!(!range.matches(&semver::Version::new(1, 1, 1)));
+    }
     #[test]
     fn example_renders_and_changes_on_click() {
         let dir =

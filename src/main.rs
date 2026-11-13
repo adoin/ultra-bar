@@ -28,6 +28,7 @@ mod task_layout;
 mod task_popup;
 mod task_relief;
 mod tray;
+mod updates;
 mod usage_meter;
 mod visual;
 mod window_commands;
@@ -83,6 +84,12 @@ fn run() -> Result<()> {
         .map_err(Into::into);
     }
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_some_and(|s| s == "--update-smoke") {
+        return updates::smoke(
+            std::path::Path::new(args.get(2).context("缺少验证目录")?),
+            args.iter().any(|s| s == "--download-current"),
+        );
+    }
     if args.get(1).is_some_and(|s| s == "--startup-smoke") {
         return startup::smoke(std::path::Path::new(args.get(2).context("缺少测试目录")?));
     }
@@ -93,6 +100,14 @@ fn run() -> Result<()> {
                 args.get(3).map(std::path::Path::new),
             )
         };
+    }
+    if args.get(1).is_some_and(|s| s == "--confirm-smoke") {
+        return unsafe {
+            ultra_bar_native_ui::dialog::capture(std::path::Path::new(
+                args.get(2).context("缺少验证目录")?,
+            ))
+        }
+        .map_err(Into::into);
     }
     if args.get(1).is_some_and(|s| s == "--script-execution-smoke") {
         return script_shortcuts::execution_smoke(&PathBuf::from(

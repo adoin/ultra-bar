@@ -1,5 +1,5 @@
 //! The host's sole provider for plugin editing. Display-only surfaces stay extensible.
-mod controls;
+pub(crate) mod controls;
 use crate::visual::{Surface, text::draw_text as DrawTextW, theme, wide};
 use anyhow::{Context, Result, ensure};
 use chrono::{Datelike, NaiveDate, NaiveTime, Timelike};
@@ -1836,12 +1836,12 @@ unsafe extern "system" fn proc(hwnd: HWND, m: u32, w: usize, l: isize) -> LRESUL
                 }
                 if id == 9001 || id == 9003 {
                     if id == 9003
-                        && MessageBoxW(
+                        && !ultra_bar_native_ui::dialog::confirm(
                             hwnd,
-                            wide("删除这条记录？").as_ptr(),
-                            wide("删除").as_ptr(),
-                            MB_YESNO | MB_DEFBUTTON2,
-                        ) != IDYES
+                            "删除",
+                            "删除这条记录？",
+                            "删除",
+                        )
                     {
                         return 0;
                     }

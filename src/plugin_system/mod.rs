@@ -1,8 +1,8 @@
 pub mod association;
-mod github;
+pub(crate) mod github;
 mod hub;
 pub mod model;
-mod package;
+pub(crate) mod package;
 pub fn diagnose_repository(input: &str, root: std::path::PathBuf) -> anyhow::Result<()> {
     let paths = model::Paths { root };
     let source = github::resolve(input)?;

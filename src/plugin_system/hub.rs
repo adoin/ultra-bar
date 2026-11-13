@@ -43,6 +43,7 @@ enum Request {
     Add(String),
     Remove,
     Install(Box<Candidate>, bool),
+    Update(Box<Candidate>),
     Local(PathBuf),
 }
 #[derive(Clone)]
@@ -173,6 +174,7 @@ fn worker(
                     let mut sources = snapshot.sources.clone();
                     sources.repositories.push(source.clone());
                     paths.save("repositories.json", &sources)?;
+                    notify_inventory();
                     snapshot.sources = sources;
                     snapshot.active = source.id;
                 }
@@ -192,6 +194,7 @@ fn worker(
                         .repositories
                         .retain(|source| source.id != snapshot.active);
                     paths.save("repositories.json", &sources)?;
+                    notify_inventory();
                     snapshot.sources = sources;
                     snapshot.active = OFFICIAL_ID.into();
                 }
@@ -207,6 +210,11 @@ fn worker(
                     notify_inventory();
                     snapshot.status = result.summary();
                 }
+                Request::Update(candidate) => {
+                    let result = crate::updates::install_update(&paths, &candidate)?;
+                    notify_inventory();
+                    snapshot.status = result.summary();
+                }
                 Request::Local(path) => {
                     let result = package::install_file(&path, true, None)?;
                     snapshot.status = result.summary();
@@ -216,50 +224,32 @@ fn worker(
             snapshot.development = development(&root);
             if snapshot.active == "installed" {
                 snapshot.entries.clear();
+                let mut all = Vec::new();
+                let mut custom_failed = false;
                 for source in &snapshot.sources.repositories {
-                    if !snapshot.registry.plugins.iter().any(|plugin| {
-                        plugin
-                            .source
-                            .as_ref()
-                            .is_none_or(|installed_source| installed_source.id == source.id)
-                    }) {
-                        continue;
+                    if snapshot.registry.plugins.is_empty() {
+                        break;
                     }
                     match github::catalog(&paths, source, force_refresh) {
                         Ok(entries) => {
-                            for candidate in entries {
-                                let eligible = snapshot
-                                    .registry
-                                    .plugins
-                                    .iter()
-                                    .any(|plugin| eligible_update(plugin, &candidate));
-                                if !eligible {
-                                    continue;
-                                }
-                                if let Some(index) = snapshot
-                                    .entries
-                                    .iter()
-                                    .position(|entry| entry.entry.id == candidate.entry.id)
-                                {
-                                    if precedence(
-                                        &candidate.entry.version,
-                                        &snapshot.entries[index].entry.version,
-                                    )?
-                                    .is_gt()
-                                    {
-                                        snapshot.entries[index] = candidate;
-                                    }
-                                } else {
-                                    snapshot.entries.push(candidate);
-                                }
-                            }
+                            all.extend(entries);
                         }
                         Err(error) => {
+                            custom_failed |= !source.official_source();
                             eprintln!("[plugin-hub] {}: {error:#}", source.id);
                             snapshot.status = "部分仓库暂时无法检查更新".into();
                         }
                     }
                 }
+                if custom_failed {
+                    all.retain(|c| !c.source.official_source());
+                }
+                snapshot.entries = snapshot
+                    .registry
+                    .plugins
+                    .iter()
+                    .filter_map(|p| crate::updates::select(p, &all))
+                    .collect();
             } else if let Some(source) = snapshot
                 .sources
                 .repositories
@@ -574,7 +564,32 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                                 }
                                 false
                             };
-                            let _ = state.sender.try_send(Request::Install(candidate, force));
+                            let existing = state
+                                .snapshot
+                                .registry
+                                .plugins
+                                .iter()
+                                .find(|p| p.id == candidate.entry.id);
+                            if !force && existing.is_some() {
+                                if existing
+                                    .and_then(|p| p.source.as_ref())
+                                    .is_some_and(|s| s.id != candidate.source.id)
+                                    && !crate::visual::dialog::confirm(
+                                        hwnd,
+                                        "更新插件",
+                                        &format!(
+                                            "更新至 {}\n来源：{}",
+                                            candidate.entry.version, candidate.source.full_name
+                                        ),
+                                        "更新",
+                                    )
+                                {
+                                    return 0;
+                                }
+                                let _ = state.sender.try_send(Request::Update(candidate));
+                            } else {
+                                let _ = state.sender.try_send(Request::Install(candidate, force));
+                            }
                         }
                         Action::Register => {
                             let menu = CreatePopupMenu();

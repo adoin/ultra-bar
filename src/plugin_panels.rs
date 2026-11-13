@@ -12,6 +12,22 @@ pub fn save_settings(
     revision: u64,
     values: Vec<String>,
 ) -> Result<()> {
+    settings_request(
+        widget,
+        owner,
+        ultra_bar_native_ui::settings_bridge::SaveRequest {
+            revision,
+            values,
+            action: None,
+            request_id: 0,
+        },
+    )
+}
+pub fn settings_request(
+    widget: &Widget,
+    owner: HWND,
+    request: ultra_bar_native_ui::settings_bridge::SaveRequest,
+) -> Result<()> {
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
     unsafe {
         anyhow::ensure!(
@@ -24,10 +40,7 @@ pub fn save_settings(
             std::ptr::null(),
         );
         anyhow::ensure!(!window.is_null(), "插件面板尚未启动");
-        let data = serde_json::to_vec(&ultra_bar_native_ui::settings_bridge::SaveRequest {
-            revision,
-            values,
-        })?;
+        let data = serde_json::to_vec(&request)?;
         anyhow::ensure!(data.len() <= 65536, "设置内容过长");
         let packet = COPYDATASTRUCT {
             dwData: ultra_bar_native_ui::settings_bridge::COPYDATA_SETTINGS,

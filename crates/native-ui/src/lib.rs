@@ -14,6 +14,7 @@ use windows_sys::{
     core::BOOL,
 };
 pub mod diagnostics;
+pub mod dialog;
 pub mod editor_bridge;
 pub mod fonts;
 pub mod form;

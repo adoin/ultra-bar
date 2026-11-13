@@ -58,7 +58,7 @@ impl ActiveStyle {
         match self {
             Self::Inset => "纯凹陷",
             Self::Underline => "底部横条",
-            Self::TopDot => "顶部黑点",
+            Self::TopDot => "顶部粗点",
         }
     }
 }
@@ -75,6 +75,7 @@ pub struct Settings {
     pub font_family: String,
     pub startup_enabled: bool,
     pub hide_fullscreen: bool,
+    pub auto_check_updates: bool,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -88,6 +89,7 @@ impl Default for Settings {
             font_family: "Segoe UI".into(),
             startup_enabled: true,
             hide_fullscreen: true,
+            auto_check_updates: true,
         }
     }
 }

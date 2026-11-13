@@ -123,30 +123,13 @@ fn sample(key: Key, mat: Material, x: f64, y: f64) -> u32 {
         if key.style == ActiveStyle::TopDot {
             // The icon can fill the entire cavity in small mode. Keep the
             // indicator in the upper padding, outside the icon's silhouette.
-            let dot = (x - width / 2.).hypot(y + 2. * scale) - 1.2 * scale;
-            let rim = (0.5 - (dot - 0.65 * scale)).clamp(0., 1.);
-            if rim == 0. {
-                return 0;
-            }
-            let mut marker = Pixel::new(
-                Hsl {
-                    h: mat.h,
-                    s: mat.s * 0.18,
-                    l: 0.55,
-                }
-                .rgb(),
-                rim * 0.85,
-            );
-            marker.over(
-                Hsl {
-                    h: mat.h,
-                    s: mat.s * 0.15,
-                    l: 0.015,
-                }
-                .rgb(),
-                (0.5 - dot).clamp(0., 1.),
-            );
-            return marker.rgba();
+            let dot = (x - width / 2.).hypot(y + 2.5 * scale) - 2. * scale;
+            let amount = (0.5 - dot).clamp(0., 1.);
+            return if amount == 0. {
+                0
+            } else {
+                Pixel::new(key.accent, amount).rgba()
+            };
         }
         if key.style == ActiveStyle::Underline {
             let bar_width = (width * 0.72)
@@ -244,6 +227,38 @@ fn generate(key: Key) -> Tile {
         pixels,
     }
 }
+/// The icon and the relief must use the same cavity, including its indicator lane.
+pub fn content_rect(rect: &RECT, dpi: i32, pressed: bool, style: ActiveStyle) -> RECT {
+    RECT {
+        bottom: rect.bottom
+            - if pressed && style == ActiveStyle::Underline {
+                (2 * dpi / 96).max(1)
+            } else {
+                0
+            },
+        ..*rect
+    }
+}
+
+pub fn icon_rect(content: &RECT, desired: i32, dpi: i32, left_aligned: bool, padding: i32) -> RECT {
+    let inset = (2 * dpi / 96).max(1);
+    let size = desired
+        .min((content.bottom - content.top - 2 * inset).max(1))
+        .min((content.right - content.left - 2 * inset).max(1));
+    let left = if left_aligned {
+        content.left + padding
+    } else {
+        content.left + (content.right - content.left - size) / 2
+    };
+    let top = content.top + (content.bottom - content.top - size) / 2;
+    RECT {
+        left,
+        top,
+        right: left + size,
+        bottom: top + size,
+    }
+}
+
 pub unsafe fn draw(
     surface: &Surface,
     rect: &RECT,
@@ -254,16 +269,9 @@ pub unsafe fn draw(
     hover: bool,
 ) {
     unsafe {
-        let width = rect.right - rect.left;
-        // Reserve a separate lower lane for the indicator. The icon and hit box
-        // keep their original positions; the cavity itself ends above that lane.
-        let height = rect.bottom
-            - rect.top
-            - if pressed && style == ActiveStyle::Underline {
-                (2 * dpi / 96).max(1)
-            } else {
-                0
-            };
+        let content = content_rect(rect, dpi, pressed, style);
+        let width = content.right - content.left;
+        let height = content.bottom - content.top;
         if width < 2 || height < 2 {
             return;
         }
@@ -311,6 +319,8 @@ pub unsafe fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
             ("blue-inset", theme::DEFAULT_ACCENT, ActiveStyle::Inset),
             ("purple", 0xb96df0, ActiveStyle::Underline),
             ("green", 0x36c7a1, ActiveStyle::Underline),
+            ("orange", 0xf13a07, ActiveStyle::Underline),
+            ("orange-dot", 0xf13a07, ActiveStyle::TopDot),
         ] {
             theme::set_accent(accent);
             let p = theme::palette();
@@ -360,6 +370,25 @@ pub unsafe fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
                     bottom: 138,
                 };
                 draw(&surface, &small, 96, index == 1, style, false, index == 2);
+                let icon = windows_sys::Win32::UI::WindowsAndMessaging::LoadIconW(
+                    std::ptr::null_mut(),
+                    windows_sys::Win32::UI::WindowsAndMessaging::IDI_INFORMATION,
+                );
+                for (area, desired) in [(&rect, 32), (&small, 16)] {
+                    let cavity = content_rect(area, 96, index == 1, style);
+                    let icon_area = icon_rect(&cavity, desired, 96, false, 0);
+                    windows_sys::Win32::UI::WindowsAndMessaging::DrawIconEx(
+                        surface.dc,
+                        icon_area.left,
+                        icon_area.top,
+                        icon,
+                        icon_area.right - icon_area.left,
+                        icon_area.bottom - icon_area.top,
+                        0,
+                        std::ptr::null_mut(),
+                        windows_sys::Win32::UI::WindowsAndMessaging::DI_NORMAL,
+                    );
+                }
             }
             SelectObject(surface.dc, old);
             surface.save_bmp(&directory.join(format!("task-relief-{name}.bmp")))?;
@@ -371,6 +400,40 @@ pub unsafe fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn icons_fit_and_share_the_cavity_center_for_both_sizes_and_all_indicators() {
+        for dpi in [96, 120, 144, 192] {
+            let unit = |value| value * dpi / 96;
+            for (height, desired) in [(30, 16), (40, 32)] {
+                for style in [
+                    ActiveStyle::Inset,
+                    ActiveStyle::Underline,
+                    ActiveStyle::TopDot,
+                ] {
+                    for pressed in [false, true] {
+                        let slot = RECT {
+                            left: 10,
+                            top: unit(4),
+                            right: 10 + unit(40),
+                            bottom: unit(height - 4),
+                        };
+                        let cavity = content_rect(&slot, dpi, pressed, style);
+                        let icon = icon_rect(&cavity, unit(desired), dpi, false, unit(6));
+                        assert!((icon.left + icon.right - cavity.left - cavity.right).abs() <= 1);
+                        assert!((icon.top + icon.bottom - cavity.top - cavity.bottom).abs() <= 1);
+                        let inset = unit(2).max(1);
+                        assert!(
+                            icon.top >= cavity.top + inset && icon.bottom <= cavity.bottom - inset
+                        );
+                        assert_eq!(icon.right - icon.left, icon.bottom - icon.top);
+                        let labeled = icon_rect(&cavity, unit(desired), dpi, true, unit(6));
+                        assert_eq!(labeled.left, cavity.left + unit(6));
+                        assert_eq!(labeled.top, icon.top);
+                    }
+                }
+            }
+        }
+    }
     fn key(pressed: bool) -> Key {
         Key {
             width: 100,
@@ -471,9 +534,9 @@ mod tests {
                 style: ActiveStyle::TopDot,
                 ..base
             };
-            let marker = sample(dot, mat, center.0, -2. * scale);
+            let marker = sample(dot, mat, center.0, -2.5 * scale);
             assert_eq!(marker >> 24, 255);
-            assert!(light(marker) < 0.04);
+            assert_eq!(marker & 0xffffff, base.accent);
             assert_eq!(
                 sample(dot, mat, center.0, 2.5 * scale),
                 sample(base, mat, center.0, 2.5 * scale)

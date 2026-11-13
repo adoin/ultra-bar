@@ -81,7 +81,7 @@ impl Drop for Staging {
         }
     }
 }
-struct Lock(windows_sys::Win32::Foundation::HANDLE);
+pub(crate) struct Lock(windows_sys::Win32::Foundation::HANDLE);
 impl Drop for Lock {
     fn drop(&mut self) {
         unsafe {
@@ -90,7 +90,7 @@ impl Drop for Lock {
         }
     }
 }
-fn lock() -> Result<Lock> {
+pub(crate) fn lock() -> Result<Lock> {
     unsafe {
         use windows_sys::Win32::{Foundation::*, System::Threading::*};
         let handle = CreateMutexW(

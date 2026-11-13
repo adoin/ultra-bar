@@ -13,6 +13,16 @@ pub const COPYDATA_SETTINGS: usize = 0x55425331;
 pub struct SaveRequest {
     pub revision: u64,
     pub values: Vec<String>,
+    #[serde(default)]
+    pub action: Option<String>,
+    #[serde(default)]
+    pub request_id: u64,
+}
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ActionResult {
+    pub request_id: u64,
+    pub ok: bool,
+    pub message: String,
 }
 static WRITE: Mutex<()> = Mutex::new(());
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
@@ -23,6 +33,8 @@ pub struct Schema {
     pub error: String,
     #[serde(default)]
     pub ack: Option<u64>,
+    #[serde(default)]
+    pub action_result: Option<ActionResult>,
 }
 pub fn changed_message() -> u32 {
     static MESSAGE: OnceLock<u32> = OnceLock::new();
@@ -44,6 +56,16 @@ pub fn load(dir: &Path) -> io::Result<Schema> {
             f.label.chars().count() > 160
                 || f.value.len() > 65536
                 || matches!(&f.kind,Kind::Choice(c) if c.is_empty() || c.len()>32)
+                || f.action.as_ref().is_some_and(|action| {
+                    action.id.is_empty()
+                        || action.id.len() > 64
+                        || !action
+                            .id
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+                        || action.tooltip.chars().count() > 160
+                        || action.icon.chars().count() > 4
+                })
         })
     {
         return Err(io::ErrorKind::InvalidData.into());
@@ -76,6 +98,7 @@ pub fn publish_ack(
         fields,
         error,
         ack,
+        action_result: None,
     };
     let bytes = serde_json::to_vec(&schema)?;
     if bytes.len() > 65536 {
@@ -100,6 +123,35 @@ pub fn publish_ack(
 pub fn error(dir: &Path, owner: isize, error: String) -> io::Result<()> {
     publish(dir, owner, load(dir)?.fields, error)
 }
+pub fn publish_action_result(
+    dir: &Path,
+    owner: isize,
+    request_id: u64,
+    ok: bool,
+    message: String,
+) -> io::Result<()> {
+    let _guard = WRITE.lock().map_err(|_| io::ErrorKind::Other)?;
+    let mut schema = load(dir)?;
+    schema.action_result = Some(ActionResult {
+        request_id,
+        ok,
+        message: message.chars().take(512).collect(),
+    });
+    crate::diagnostics::event(
+        "settings",
+        "action.completed",
+        serde_json::json!({"request_id":request_id,"ok":ok}),
+    );
+    let pending = dir.join("settings-schema.json.new");
+    std::fs::write(&pending, serde_json::to_vec(&schema)?)?;
+    std::fs::rename(pending, dir.join(FILE))?;
+    if owner != 0 {
+        unsafe {
+            PostMessageW(owner as HWND, changed_message(), 0, 0);
+        }
+    }
+    Ok(())
+}
 pub fn error_ack(dir: &Path, owner: isize, error: String, ack: Option<u64>) -> io::Result<()> {
     publish_ack(dir, owner, load(dir)?.fields, error, ack)
 }
@@ -122,6 +174,11 @@ mod tests {
         )
         .unwrap();
         let first = load(&dir).unwrap();
+        publish_action_result(&dir, 0, 77, true, "连接成功".into()).unwrap();
+        let action = load(&dir).unwrap();
+        assert_eq!(action.revision, first.revision);
+        assert_eq!(action.action_result.unwrap().request_id, 77);
+        assert!(action.fields[1].value.is_empty());
         assert!(
             !std::fs::read_to_string(dir.join(FILE))
                 .unwrap()

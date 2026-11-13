@@ -34,8 +34,16 @@ pub struct Field {
     pub label: String,
     pub value: String,
     pub kind: Kind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<FieldAction>,
     #[serde(skip)]
     pub validate: Option<Validator>,
+}
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct FieldAction {
+    pub id: String,
+    pub tooltip: String,
+    pub icon: String,
 }
 pub type Validator = fn(&str) -> Result<(), String>;
 pub fn switch_state(field: &Field) -> Option<bool> {
@@ -165,11 +173,20 @@ pub unsafe fn draw_switch(dc: HDC, bounds: RECT, checked: bool, enabled: bool) {
 }
 
 impl Field {
+    pub fn with_action(mut self, id: &str, tooltip: &str, icon: &str) -> Self {
+        self.action = Some(FieldAction {
+            id: id.into(),
+            tooltip: tooltip.into(),
+            icon: icon.into(),
+        });
+        self
+    }
     pub fn text(label: &str, value: impl Into<String>) -> Self {
         Self {
             label: label.into(),
             value: value.into(),
             kind: Kind::Text,
+            action: None,
             validate: None,
         }
     }
@@ -178,6 +195,7 @@ impl Field {
             label: label.into(),
             value: String::new(),
             kind: Kind::Secret,
+            action: None,
             validate: None,
         }
     }
@@ -186,6 +204,7 @@ impl Field {
             label: label.into(),
             value: index.to_string(),
             kind: Kind::Choice(choices.iter().map(|s| s.to_string()).collect()),
+            action: None,
             validate: None,
         }
     }
@@ -194,6 +213,7 @@ impl Field {
             label: label.into(),
             value: url.into(),
             kind: Kind::Link,
+            action: None,
             validate: None,
         }
     }
