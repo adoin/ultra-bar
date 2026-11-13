@@ -120,6 +120,34 @@ fn sample(key: Key, mat: Material, x: f64, y: f64) -> u32 {
         pixel.over(mat.dark, dark);
         pixel.over(mat.light, light);
     } else if coverage == 0. {
+        if key.style == ActiveStyle::TopDot {
+            // The icon can fill the entire cavity in small mode. Keep the
+            // indicator in the upper padding, outside the icon's silhouette.
+            let dot = (x - width / 2.).hypot(y + 2. * scale) - 1.2 * scale;
+            let rim = (0.5 - (dot - 0.65 * scale)).clamp(0., 1.);
+            if rim == 0. {
+                return 0;
+            }
+            let mut marker = Pixel::new(
+                Hsl {
+                    h: mat.h,
+                    s: mat.s * 0.18,
+                    l: 0.55,
+                }
+                .rgb(),
+                rim * 0.85,
+            );
+            marker.over(
+                Hsl {
+                    h: mat.h,
+                    s: mat.s * 0.15,
+                    l: 0.015,
+                }
+                .rgb(),
+                (0.5 - dot).clamp(0., 1.),
+            );
+            return marker.rgba();
+        }
         if key.style == ActiveStyle::Underline {
             let bar_width = (width * 0.72)
                 .min(44. * scale)
@@ -184,27 +212,6 @@ fn sample(key: Key, mat: Material, x: f64, y: f64) -> u32 {
             * 0.38;
         pixel.over(mat.inner_dark, contact);
         pixel.over(mat.inner_light, light);
-    }
-    if key.pressed {
-        match key.style {
-            ActiveStyle::Inset => {}
-            ActiveStyle::Underline => {}
-            ActiveStyle::TopDot => {
-                let radius = 1.35 * scale;
-                let dot = (x - width / 2.).hypot(y - 2.5 * scale) - radius;
-                let rim = (0.5 - (dot - 0.65 * scale)).clamp(0., 1.) * coverage;
-                pixel.over(mat.inner_light, rim * 0.60);
-                pixel.over(
-                    Hsl {
-                        h: mat.h,
-                        s: mat.s * 0.15,
-                        l: 0.015,
-                    }
-                    .rgb(),
-                    (0.5 - dot).clamp(0., 1.) * coverage,
-                );
-            }
-        }
     }
     if !key.pressed {
         // Keep the raised outline inside the item, preserving the two-pixel gaps.
@@ -464,9 +471,12 @@ mod tests {
                 style: ActiveStyle::TopDot,
                 ..base
             };
-            assert!(
-                light(sample(dot, mat, center.0, 2.5 * scale))
-                    < light(sample(base, mat, center.0, 2.5 * scale))
+            let marker = sample(dot, mat, center.0, -2. * scale);
+            assert_eq!(marker >> 24, 255);
+            assert!(light(marker) < 0.04);
+            assert_eq!(
+                sample(dot, mat, center.0, 2.5 * scale),
+                sample(base, mat, center.0, 2.5 * scale)
             );
         }
     }

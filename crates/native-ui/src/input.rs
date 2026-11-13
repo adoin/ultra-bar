@@ -4,6 +4,44 @@ use windows_sys::Win32::{
     Graphics::Gdi::*,
     UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
 };
+const REPAINT_EDIT: u32 = WM_APP + 0x341;
+const PAINTING: &str = "UltraBar.Edit.Painting.v1";
+const REPAINT_PENDING: &str = "UltraBar.Edit.RepaintPending.v1";
+
+// Native EDIT also draws directly during selection, focus and text changes.
+// Those GDI writes clear alpha on a glass window. Repair once after the native
+// operation, using the same opaque surface as WM_PAINT (never a render timer).
+unsafe fn queue_opaque_repaint(edit: HWND) {
+    unsafe {
+        if GetPropW(edit, crate::wide(PAINTING).as_ptr()).is_null()
+            && GetPropW(edit, crate::wide(REPAINT_PENDING).as_ptr()).is_null()
+        {
+            SetPropW(
+                edit,
+                crate::wide(REPAINT_PENDING).as_ptr(),
+                1usize as HANDLE,
+            );
+            PostMessageW(edit, REPAINT_EDIT, 0, 0);
+        }
+    }
+}
+
+unsafe fn print_client(hwnd: HWND, dc: HDC, flags: isize) {
+    unsafe {
+        let key = crate::wide(PAINTING);
+        let previous = GetPropW(hwnd, key.as_ptr());
+        SetPropW(hwnd, key.as_ptr(), 1usize as HANDLE);
+        SetBkMode(dc, OPAQUE as i32);
+        SetBkColor(dc, crate::theme::palette().field);
+        SetTextColor(dc, crate::theme::palette().text);
+        DefSubclassProc(hwnd, WM_PRINTCLIENT, dc as usize, flags);
+        if previous.is_null() {
+            RemovePropW(hwnd, key.as_ptr());
+        } else {
+            SetPropW(hwnd, key.as_ptr(), previous);
+        }
+    }
+}
 /// # Safety
 /// Attach on the edit control's UI thread.
 pub unsafe fn attach(edit: HWND) {
@@ -50,6 +88,7 @@ unsafe extern "system" fn parent_color(
             let mut name = [0u16; 16];
             let len = GetClassNameW(child, name.as_mut_ptr(), name.len() as i32);
             if String::from_utf16_lossy(&name[..len.max(0) as usize]).eq_ignore_ascii_case("edit") {
+                queue_opaque_repaint(child);
                 let dc = w as HDC;
                 SetBkMode(dc, OPAQUE as i32);
                 SetBkColor(dc, crate::theme::palette().field);
@@ -243,12 +282,7 @@ unsafe fn print_control(hwnd: HWND, target: HDC) {
                 origin.y - window.top,
                 std::ptr::null_mut(),
             );
-            DefSubclassProc(
-                hwnd,
-                WM_PRINTCLIENT,
-                surface.dc as usize,
-                (PRF_CLIENT | PRF_ERASEBKGND) as isize,
-            );
+            print_client(hwnd, surface.dc, (PRF_CLIENT | PRF_ERASEBKGND) as isize);
             RestoreDC(surface.dc, saved);
             let saved = SaveDC(target);
             BeginPath(target);
@@ -276,12 +310,16 @@ unsafe fn paint_client(hwnd: HWND, field: bool) {
                     crate::theme::background_brush()
                 },
             );
-            DefSubclassProc(
-                hwnd,
-                WM_PRINTCLIENT,
-                surface.dc as usize,
-                (PRF_CLIENT | PRF_ERASEBKGND) as isize,
-            );
+            if field {
+                print_client(hwnd, surface.dc, (PRF_CLIENT | PRF_ERASEBKGND) as isize);
+            } else {
+                DefSubclassProc(
+                    hwnd,
+                    WM_PRINTCLIENT,
+                    surface.dc as usize,
+                    (PRF_CLIENT | PRF_ERASEBKGND) as isize,
+                );
+            }
             surface.blit_opaque(dc);
         }
         EndPaint(hwnd, &ps);
@@ -329,6 +367,18 @@ unsafe extern "system" fn proc(
             RemoveWindowSubclass(hwnd, Some(proc), id);
             RemovePropW(hwnd, crate::wide("UltraBar.Edit.Wheel.v1").as_ptr());
             RemovePropW(hwnd, crate::wide("UltraBar.Edit.Composite").as_ptr());
+            RemovePropW(hwnd, crate::wide(PAINTING).as_ptr());
+            RemovePropW(hwnd, crate::wide(REPAINT_PENDING).as_ptr());
+        }
+        if message == REPAINT_EDIT {
+            RemovePropW(hwnd, crate::wide(REPAINT_PENDING).as_ptr());
+            RedrawWindow(
+                hwnd,
+                std::ptr::null(),
+                std::ptr::null_mut(),
+                RDW_INVALIDATE | RDW_FRAME | RDW_UPDATENOW,
+            );
+            return 0;
         }
         if message == WM_NCCALCSIZE {
             let result = DefSubclassProc(hwnd, message, w, l);
@@ -423,6 +473,73 @@ unsafe extern "system" fn proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn opaque_edit_fill_matches_frame_and_repaint_does_not_loop() {
+        unsafe {
+            let owner = CreateWindowExW(
+                0,
+                crate::wide("STATIC").as_ptr(),
+                std::ptr::null(),
+                WS_POPUP,
+                -10000,
+                -10000,
+                300,
+                100,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            let edit = CreateWindowExW(
+                0,
+                crate::wide("EDIT").as_ptr(),
+                std::ptr::null(),
+                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL as u32,
+                0,
+                0,
+                240,
+                30,
+                owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            );
+            assert!(!owner.is_null() && !edit.is_null());
+            attach(edit);
+            let surface = crate::Surface::new(240, 30).unwrap();
+            let field = crate::theme::palette().field;
+            for text in ["", "60", ""] {
+                SendMessageW(edit, WM_SETTEXT, 0, crate::wide(text).as_ptr() as isize);
+                SendMessageW(edit, EM_SETSEL, 0, -1);
+                SendMessageW(
+                    edit,
+                    WM_PRINT,
+                    surface.dc as usize,
+                    (PRF_CLIENT | PRF_NONCLIENT) as isize,
+                );
+                // Far from text, both the native client and its padding must be
+                // the same flat color, without a second rectangular fill.
+                assert_eq!(GetPixel(surface.dc, 220, 15), field);
+                assert_eq!(GetPixel(surface.dc, 220, 3), field);
+            }
+            let dc = GetDC(edit);
+            SendMessageW(owner, WM_CTLCOLOREDIT, dc as usize, edit as isize);
+            ReleaseDC(edit, dc);
+            assert!(!GetPropW(edit, crate::wide(REPAINT_PENDING).as_ptr()).is_null());
+            let mut message: MSG = std::mem::zeroed();
+            assert_ne!(
+                PeekMessageW(&mut message, edit, REPAINT_EDIT, REPAINT_EDIT, PM_REMOVE),
+                0
+            );
+            DispatchMessageW(&message);
+            assert!(GetPropW(edit, crate::wide(REPAINT_PENDING).as_ptr()).is_null());
+            assert_eq!(
+                PeekMessageW(&mut message, edit, REPAINT_EDIT, REPAINT_EDIT, PM_REMOVE),
+                0
+            );
+            DestroyWindow(owner);
+        }
+    }
     #[test]
     fn single_line_is_centered_and_multiline_keeps_top_padding() {
         for dpi in [96, 144, 192] {

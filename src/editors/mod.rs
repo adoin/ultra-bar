@@ -35,6 +35,7 @@ struct View {
     hwnd: HWND,
     host: HWND,
     caller: HWND,
+    disabled_caller: bool,
     plugin: String,
     form: Form,
     bindings: Vec<Binding>,
@@ -823,6 +824,7 @@ unsafe fn create(
             hwnd: null_mut(),
             host,
             caller,
+            disabled_caller: false,
             plugin,
             form,
             bindings: vec![],
@@ -1172,7 +1174,14 @@ unsafe fn create(
         layout(&mut view);
         view.loading = false;
         if !view.mount {
-            EnableWindow(caller, 0);
+            // Local settings use the shell itself as caller. Disabling it would
+            // disable the entire taskbar, including application and tray clicks.
+            // A plugin's separate caller can still be modal; restore it only if
+            // this editor actually disabled it.
+            if caller != host && IsWindowEnabled(caller) != 0 {
+                EnableWindow(caller, 0);
+                view.disabled_caller = true;
+            }
             if !std::env::args().any(|a| a == "--editor-host-smoke" || a == "--script-drop-smoke") {
                 ShowWindow(hwnd, SW_SHOW);
                 SetForegroundWindow(hwnd);
@@ -1204,7 +1213,8 @@ unsafe fn create(
         ultra_bar_native_ui::diagnostics::event(
             "render",
             "editor.opened",
-            serde_json::json!({"plugin":view.plugin,"session":view.form.session,"fields":view.form.fields.len(),"mounted":view.mount}),
+            serde_json::json!({"plugin":view.plugin,"session":view.form.session,"fields":view.form.fields.len(),"mounted":view.mount,
+                "host_enabled":IsWindowEnabled(host)!=0,"caller_disabled":view.disabled_caller}),
         );
         Ok(Window(view))
     }
@@ -1889,7 +1899,7 @@ unsafe extern "system" fn proc(hwnd: HWND, m: u32, w: usize, l: isize) -> LRESUL
                 0
             }
             WM_DESTROY => {
-                if !view.mount {
+                if view.disabled_caller {
                     EnableWindow(view.caller, 1);
                 }
                 send(view, "closed", Values::new());
@@ -2023,6 +2033,7 @@ pub unsafe fn smoke(directory: &std::path::Path, schema: Option<&std::path::Path
             pump_test_events();
             let window = manager.windows.first_mut().context("宿主编辑器创建失败")?;
             let view = &mut window.0;
+            ensure!(IsWindowEnabled(owner) != 0, "打开编辑器禁用了宿主任务栏");
             pump_test_events();
             ensure!(
                 events.iter().any(|e| e.action == "opened"),

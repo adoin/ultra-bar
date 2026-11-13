@@ -14,6 +14,7 @@ struct Summary {
     lunar: String,
     weather: String,
     tooltip: String,
+    clock_format: String,
     utc_offset_seconds: i32,
     updated: i64,
 }
@@ -73,6 +74,8 @@ impl Feed {
                 && data.weather.chars().count() <= 80
                 && data.lunar.chars().count() <= 40
                 && data.tooltip.chars().count() <= 1024
+                && data.clock_format.chars().count() <= 128
+                && !data.clock_format.chars().any(char::is_control)
                 && data.utc_offset_seconds.unsigned_abs() <= 86400
             {
                 self.summaries.insert(widget.id.clone(), data);
@@ -109,6 +112,11 @@ impl Feed {
             .filter(|s| (now() as i64 - s.updated).abs() <= 180)
         else {
             return (template.replace("{time}", time), String::new());
+        };
+        let pattern = if summary.clock_format.is_empty() {
+            pattern
+        } else {
+            &summary.clock_format
         };
         let time =
             regional_time(pattern, summary.utc_offset_seconds).unwrap_or_else(|| time.into());

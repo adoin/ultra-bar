@@ -25,6 +25,7 @@ pub struct Row {
 pub struct Snapshot {
     pub pages: Vec<Vec<Row>>,
     pub plugins: Vec<crate::settings_editor::PluginPage>,
+    pub clock_provider: Option<String>,
 }
 struct State {
     owner: HWND,
@@ -33,6 +34,7 @@ struct State {
     scroll: usize,
     dpi: i32,
     font: HFONT,
+    plugin_font: HFONT,
     heading: HFONT,
     icons: HFONT,
     capture: Option<std::path::PathBuf>,
@@ -82,6 +84,7 @@ impl Window {
                 scroll: 0,
                 dpi,
                 font: font("Segoe UI", 13, 400),
+                plugin_font: font("Segoe UI", 12, 600),
                 heading: font("Segoe UI", 22, 600),
                 icons: font("Segoe MDL2 Assets", 18, 400),
                 capture: None,
@@ -112,6 +115,7 @@ impl Window {
             );
             if hwnd.is_null() {
                 ultra_bar_native_ui::fonts::delete_object(state.font);
+                ultra_bar_native_ui::fonts::delete_object(state.plugin_font);
                 ultra_bar_native_ui::fonts::delete_object(state.heading);
                 ultra_bar_native_ui::fonts::delete_object(state.icons);
                 return None;
@@ -168,13 +172,13 @@ impl Window {
                 SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
             );
             ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
-            for tab in 0..4 + self.state.data.plugins.len() {
+            for tab in 0..TABS.len() + self.state.data.plugins.len() {
                 self.state.tab = tab;
                 let id = self
                     .state
                     .data
                     .plugins
-                    .get(tab.wrapping_sub(4))
+                    .get(tab.wrapping_sub(TABS.len()))
                     .map(|p| p.id.clone());
                 self.state
                     .editor
@@ -192,7 +196,7 @@ impl Window {
                 .state
                 .data
                 .plugins
-                .get(self.state.tab.wrapping_sub(4))
+                .get(self.state.tab.wrapping_sub(TABS.len()))
                 .map(|p| p.id.clone());
             self.state
                 .editor
@@ -202,7 +206,7 @@ impl Window {
                     .plugins
                     .iter()
                     .position(|p| p.id == id)
-                    .map_or(3, |i| 4 + i);
+                    .map_or(TABS.len() - 1, |i| TABS.len() + i);
             }
             self.state.nav_scroll = self
                 .state
@@ -216,7 +220,7 @@ impl Window {
     pub unsafe fn show_plugin(&mut self, id: &str) {
         unsafe {
             if let Some(index) = self.state.data.plugins.iter().position(|p| p.id == id) {
-                self.state.tab = 4 + index;
+                self.state.tab = TABS.len() + index;
                 self.state.nav_scroll = index.saturating_sub(4);
                 self.state.editor.select(
                     self.hwnd,
@@ -241,12 +245,21 @@ impl Drop for Window {
         unsafe {
             DestroyWindow(self.hwnd);
             ultra_bar_native_ui::fonts::delete_object(self.state.font);
+            ultra_bar_native_ui::fonts::delete_object(self.state.plugin_font);
             ultra_bar_native_ui::fonts::delete_object(self.state.heading);
             ultra_bar_native_ui::fonts::delete_object(self.state.icons);
         }
     }
 }
-const TABS: [&str; 4] = ["外观", "时间", "托盘", "插件"];
+const TABS: [&str; 5] = ["常规", "外观", "时间", "托盘", "插件"];
+fn choices(command: usize) -> &'static [(usize, &'static str)] {
+    match command {
+        2 | 3 => &[(3, "仅图标"), (2, "根据空间自动展示")],
+        7 | 8 => &[(7, "正常"), (8, "小")],
+        17 => &[(50, "纯凹陷"), (51, "底部横条"), (52, "顶部黑点")],
+        _ => &[],
+    }
+}
 unsafe fn sync_tips(s: &mut State) {
     unsafe {
         let u = |n| n * s.dpi / 96;
@@ -254,7 +267,7 @@ unsafe fn sync_tips(s: &mut State) {
             bounds: (u(646), 0, u(700), u(58)),
             text: "关闭".into(),
         }];
-        if s.tab >= 4 {
+        if s.tab >= TABS.len() {
             tips.extend([
                 Tip {
                     bounds: (u(545), u(478), u(590), u(524)),
@@ -267,7 +280,7 @@ unsafe fn sync_tips(s: &mut State) {
             ]);
         }
         for (i, plugin) in s.data.plugins.iter().enumerate().skip(s.nav_scroll).take(5) {
-            let y = 306 + (i - s.nav_scroll) as i32 * 42;
+            let y = 304 + (i - s.nav_scroll) as i32 * 42;
             tips.push(Tip {
                 bounds: (u(12), u(y), u(160), u(y + 38)),
                 text: plugin.name.clone(),
@@ -330,7 +343,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                     InvalidateRect(hwnd, null(), 0);
                     return 0;
                 }
-                if s.tab >= 4 {
+                if s.tab >= TABS.len() {
                     s.editor.scroll(hwnd, ((w >> 16) as i16) < 0, s.dpi);
                     return 0;
                 }
@@ -348,19 +361,19 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                 let y = (l >> 16) as i16 as i32 * 96 / s.dpi;
                 if y < 58 && x > 646 {
                     ShowWindow(hwnd, SW_HIDE);
-                } else if x < 164 && (88..280).contains(&y) {
-                    s.tab = ((y - 88) / 48) as usize;
+                } else if x < 164 && (88..288).contains(&y) {
+                    s.tab = ((y - 88) / 40) as usize;
                     s.editor.select(hwnd, None, s.font, s.dpi);
                     s.scroll = 0;
                     InvalidateRect(hwnd, null(), 0);
-                } else if x < 164 && (306..516).contains(&y) {
-                    let index = s.nav_scroll + ((y - 306) / 42) as usize;
+                } else if x < 164 && (304..514).contains(&y) {
+                    let index = s.nav_scroll + ((y - 304) / 42) as usize;
                     if let Some(plugin) = s.data.plugins.get(index) {
-                        s.tab = 4 + index;
+                        s.tab = TABS.len() + index;
                         s.editor
                             .select(hwnd, Some(plugin.id.clone()), s.font, s.dpi);
                     }
-                } else if s.tab >= 4 {
+                } else if s.tab >= TABS.len() {
                     if s.editor.click(hwnd, x, y, s.font, s.icons, s.dpi) {
                         PostMessageW(s.owner, message(), 90, 0);
                     }
@@ -372,7 +385,14 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                         .get(s.tab)
                         .and_then(|rows| rows.get(s.scroll + ((y - 100) / 66) as usize))
                 {
-                    PostMessageW(s.owner, message(), row.command, 0);
+                    let options = choices(row.command);
+                    if options.is_empty() {
+                        PostMessageW(s.owner, message(), row.command, 0);
+                    } else if (27..58).contains(&((y - 100) % 66)) && (200..660).contains(&x) {
+                        let index =
+                            ((x - 200) as usize * options.len() / 460).min(options.len() - 1);
+                        PostMessageW(s.owner, message(), options[index].0, 0);
+                    }
                 }
                 sync_tips(s);
                 0
@@ -418,12 +438,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                     };
                     SelectObject(dc, s.heading);
                     text("设置", 24, 16, 150, 40, palette.text);
-                    let title = if s.tab < 4 {
+                    let title = if s.tab < TABS.len() {
                         TABS[s.tab]
                     } else {
                         s.data
                             .plugins
-                            .get(s.tab - 4)
+                            .get(s.tab - TABS.len())
                             .map_or("插件设置", |p| p.name.as_str())
                     };
                     text(title, 194, 33, 450, 40, palette.text);
@@ -435,9 +455,9 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                             RoundRect(
                                 dc,
                                 unit(12),
-                                unit(88 + i as i32 * 48),
+                                unit(88 + i as i32 * 40),
                                 unit(160),
-                                unit(130 + i as i32 * 48),
+                                unit(126 + i as i32 * 40),
                                 unit(12),
                                 unit(12),
                             );
@@ -447,7 +467,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                         text(
                             tab,
                             30,
-                            88 + i as i32 * 48,
+                            88 + i as i32 * 40,
                             120,
                             42,
                             if i == s.tab {
@@ -458,12 +478,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                         );
                     }
                     if !s.data.plugins.is_empty() {
-                        text("插件设置", 24, 282, 130, 20, palette.muted);
+                        SelectObject(dc, s.plugin_font);
                         for (i, plugin) in
                             s.data.plugins.iter().enumerate().skip(s.nav_scroll).take(5)
                         {
-                            let y = 306 + (i - s.nav_scroll) as i32 * 42;
-                            if s.tab == 4 + i {
+                            let y = 304 + (i - s.nav_scroll) as i32 * 42;
+                            if s.tab == TABS.len() + i {
                                 let brush = SelectObject(dc, theme::field_brush());
                                 RoundRect(
                                     dc,
@@ -482,16 +502,37 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                                 y,
                                 132,
                                 38,
-                                if s.tab == 4 + i {
+                                if s.tab == TABS.len() + i {
                                     palette.text
                                 } else {
                                     palette.muted
                                 },
                             );
                         }
+                        SelectObject(dc, s.font);
                     }
-                    if s.tab >= 4 {
+                    if s.tab >= TABS.len() {
                         s.editor.draw(&surface, s.dpi, s.font, s.icons);
+                    }
+                    if s.tab == 2
+                        && let Some(provider) = &s.data.clock_provider
+                    {
+                        text(
+                            &format!("时间区域由 {provider} 管理"),
+                            200,
+                            112,
+                            460,
+                            28,
+                            palette.text,
+                        );
+                        text(
+                            "请在左侧对应插件的设置中调整。",
+                            200,
+                            148,
+                            460,
+                            28,
+                            palette.muted,
+                        );
                     }
                     if let Some(rows) = s.data.pages.get(s.tab) {
                         for (i, row) in rows.iter().skip(s.scroll).take(6).enumerate() {
@@ -508,7 +549,57 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                             );
                             SelectObject(dc, b);
                             text(&row.title, 200, y + 5, 420, 25, palette.text);
-                            text(&row.detail, 200, y + 29, 420, 20, palette.muted);
+                            let options = choices(row.command);
+                            if !options.is_empty() {
+                                let width = 460 / options.len() as i32;
+                                for (index, (_, label)) in options.iter().enumerate() {
+                                    let x = 200 + index as i32 * width;
+                                    let selected = row.detail == *label;
+                                    let ring = CreatePen(
+                                        PS_SOLID,
+                                        unit(1).max(1),
+                                        if selected {
+                                            palette.active_border
+                                        } else {
+                                            palette.muted
+                                        },
+                                    );
+                                    let old_pen = SelectObject(dc, ring);
+                                    let old_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+                                    Ellipse(dc, unit(x), unit(y + 33), unit(x + 14), unit(y + 47));
+                                    if selected {
+                                        let dot = CreateSolidBrush(palette.active_border);
+                                        SelectObject(dc, dot);
+                                        Ellipse(
+                                            dc,
+                                            unit(x + 4),
+                                            unit(y + 37),
+                                            unit(x + 10),
+                                            unit(y + 43),
+                                        );
+                                        SelectObject(dc, old_brush);
+                                        ultra_bar_native_ui::fonts::delete_object(dot);
+                                    } else {
+                                        SelectObject(dc, old_brush);
+                                    }
+                                    SelectObject(dc, old_pen);
+                                    ultra_bar_native_ui::fonts::delete_object(ring);
+                                    text(
+                                        label,
+                                        x + 22,
+                                        y + 29,
+                                        width - 24,
+                                        22,
+                                        if selected {
+                                            palette.text
+                                        } else {
+                                            palette.muted
+                                        },
+                                    );
+                                }
+                            } else {
+                                text(&row.detail, 200, y + 29, 420, 20, palette.muted);
+                            }
                             if matches!(row.command, 41 | 42) {
                                 ultra_bar_native_ui::form::draw_switch(
                                     dc,
@@ -521,7 +612,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                                     row.detail == "开启",
                                     true,
                                 );
-                            } else {
+                            } else if options.is_empty() {
                                 SelectObject(dc, s.icons);
                                 text("\u{e76c}", 644, y + 14, 24, 28, palette.muted);
                             }

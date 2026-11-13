@@ -61,13 +61,6 @@ impl ActiveStyle {
             Self::TopDot => "顶部黑点",
         }
     }
-    pub fn next(self) -> Self {
-        match self {
-            Self::Inset => Self::Underline,
-            Self::Underline => Self::TopDot,
-            Self::TopDot => Self::Inset,
-        }
-    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]

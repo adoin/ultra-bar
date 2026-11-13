@@ -437,7 +437,22 @@ unsafe extern "system" fn popup_proc(
     unsafe {
         if message == WM_NCDESTROY {
             RemoveWindowSubclass(hwnd, Some(popup_proc), id);
+            RemovePropW(hwnd, wide("UltraBar.Combo.Wheel.v1").as_ptr());
             return DefSubclassProc(hwnd, message, w, l);
+        }
+        if message == WM_MOUSEWHEEL {
+            let key = wide("UltraBar.Combo.Wheel.v1");
+            let delta =
+                (w >> 16) as u16 as i16 as i32 + GetPropW(hwnd, key.as_ptr()) as isize as i32;
+            SetPropW(hwnd, key.as_ptr(), (delta % 120) as isize as HANDLE);
+            if delta / 120 != 0 {
+                let top = SendMessageW(hwnd, LB_GETTOPINDEX, 0, 0).max(0);
+                let count = SendMessageW(hwnd, LB_GETCOUNT, 0, 0).max(0);
+                let next = (top - (3 * (delta / 120)) as isize).clamp(0, (count - 1).max(0));
+                SendMessageW(hwnd, LB_SETTOPINDEX, next as usize, 0);
+                InvalidateRect(hwnd, null(), 0);
+            }
+            return 0;
         }
         if message == PREPARE_POPUP {
             opaque_popup(hwnd);
@@ -525,7 +540,7 @@ pub(super) unsafe fn create(
                 | WS_VISIBLE
                 | style
                 | if class == "COMBOBOX" {
-                    CBS_OWNERDRAWFIXED as u32 | CBS_HASSTRINGS as u32
+                    CBS_OWNERDRAWFIXED as u32 | CBS_HASSTRINGS as u32 | WS_VSCROLL
                 } else {
                     0
                 },

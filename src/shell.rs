@@ -2880,13 +2880,8 @@ unsafe fn paint(state: &mut State) {
             .map(|index| state.tray_snapshot.items[*index].key.clone())
             .collect();
         let foreground = GetAncestor(effective_foreground(), GA_ROOTOWNER);
-        let clock_provider = state.widgets.iter().find(|widget| {
-            widget.slot == Slot::Clock
-                && state.settings.clock_extension != "system"
-                && (state.settings.clock_extension.is_empty()
-                    || crate::plugin_system::model::canonical_id(&state.settings.clock_extension)
-                        == widget.id)
-        });
+        let clock_provider =
+            selected_clock_provider(&state.widgets, &state.settings.clock_extension);
         let (clock_text, clock_tip) = clock_provider
             .map(|widget| {
                 state.clock_feed.render(
@@ -4217,6 +4212,17 @@ unsafe fn apply_task_click(state: &mut State, hwnd: HWND, click: TaskClick) {
     }
 }
 
+fn selected_clock_provider<'a>(
+    widgets: &'a [crate::plugins::Widget],
+    extension: &str,
+) -> Option<&'a crate::plugins::Widget> {
+    widgets.iter().find(|widget| {
+        widget.slot == Slot::Clock
+            && extension != "system"
+            && (extension.is_empty()
+                || crate::plugin_system::model::canonical_id(extension) == widget.id)
+    })
+}
 fn settings_snapshot(state: &State) -> crate::settings_window::Snapshot {
     use crate::settings_window::{Row, Snapshot};
     let row = |command, title: &str, detail: &str| Row {
@@ -4238,9 +4244,33 @@ fn settings_snapshot(state: &State) -> crate::settings_window::Snapshot {
             }),
         })
         .collect();
-    Snapshot {
+    let clock_provider = selected_clock_provider(&state.widgets, &state.settings.clock_extension)
+        .map(|widget| widget.name.clone());
+    let mut snapshot = Snapshot {
+        clock_provider,
         plugins,
         pages: vec![
+            vec![
+                row(
+                    41,
+                    "开机启动",
+                    if state.settings.startup_enabled {
+                        "开启"
+                    } else {
+                        "关闭"
+                    },
+                ),
+                row(
+                    42,
+                    "全屏时隐藏",
+                    if state.settings.hide_fullscreen {
+                        "开启"
+                    } else {
+                        "关闭"
+                    },
+                ),
+                row(13, "同步系统固定应用", ""),
+            ],
             vec![
                 row(
                     if state.settings.icons_only { 2 } else { 3 },
@@ -4267,26 +4297,7 @@ fn settings_snapshot(state: &State) -> crate::settings_window::Snapshot {
                 row(17, "激活样式", state.settings.active_style.label()),
                 row(14, "主色", &state.settings.accent_color),
                 row(40, "默认字体", &state.settings.font_family),
-                row(
-                    41,
-                    "开机启动",
-                    if state.settings.startup_enabled {
-                        "开启"
-                    } else {
-                        "关闭"
-                    },
-                ),
-                row(
-                    42,
-                    "全屏时隐藏",
-                    if state.settings.hide_fullscreen {
-                        "开启"
-                    } else {
-                        "关闭"
-                    },
-                ),
                 row(15, "恢复默认主色", ""),
-                row(13, "同步系统固定应用", ""),
             ],
             vec![
                 row(23, "时间格式", &state.settings.clock_format),
@@ -4328,7 +4339,11 @@ fn settings_snapshot(state: &State) -> crate::settings_window::Snapshot {
             ],
             vec![row(10, "插件中心", "管理安装和插件仓库")],
         ],
+    };
+    if snapshot.clock_provider.is_some() {
+        snapshot.pages[2].clear();
     }
+    snapshot
 }
 unsafe fn refresh_settings(state: &mut State) {
     unsafe {
@@ -4433,13 +4448,17 @@ unsafe fn settings_action(state: &mut State, result: usize) {
             }
         } else if result == 1 {
             execute(state, Action::Exit);
-        } else if result == 17 {
+        } else if matches!(result, 50..=52) {
             let mut next = state.settings.clone();
-            next.active_style = next.active_style.next();
+            next.active_style = match result {
+                50 => crate::settings::ActiveStyle::Inset,
+                51 => crate::settings::ActiveStyle::Underline,
+                _ => crate::settings::ActiveStyle::TopDot,
+            };
             match next.save() {
                 Ok(()) => {
                     state.settings = next;
-                    InvalidateRect(hwnd, null(), 0);
+                    InvalidateRect(state.hwnd, null(), 0);
                 }
                 Err(error) => app_error(hwnd, &error),
             }
@@ -4575,7 +4594,7 @@ unsafe fn settings_action(state: &mut State, result: usize) {
                         };
                     }
                     position(state);
-                    InvalidateRect(hwnd, null(), 0);
+                    InvalidateRect(state.hwnd, null(), 0);
                 }
                 Err(error) => {
                     MessageBoxW(
