@@ -36,6 +36,7 @@ struct Snapshot {
     development: Vec<Development>,
     status: String,
     busy: bool,
+    busy_plugin: Option<String>,
 }
 enum Request {
     Select(String),
@@ -133,6 +134,7 @@ fn worker(
         development: development(&root),
         status: String::new(),
         busy: false,
+        busy_plugin: None,
     };
     let publish = |snapshot: &Snapshot| -> bool {
         if updates.send(Arc::new(snapshot.clone())).is_err() {
@@ -149,6 +151,12 @@ fn worker(
     while let Ok(request) = requests.recv() {
         let force_refresh = matches!(request, Request::Refresh);
         snapshot.busy = true;
+        snapshot.busy_plugin = match &request {
+            Request::Install(candidate, _) | Request::Update(candidate) => {
+                Some(candidate.entry.id.clone())
+            }
+            _ => None,
+        };
         snapshot.status = "正在处理…".into();
         if let Request::Select(id) = &request {
             snapshot.active = id.clone();
@@ -277,6 +285,7 @@ fn worker(
             snapshot.status = format!("{error:#}");
         }
         snapshot.busy = false;
+        snapshot.busy_plugin = None;
         if !publish(&snapshot) {
             return;
         }
@@ -308,6 +317,7 @@ impl Hub {
                 development: vec![],
                 status: String::new(),
                 busy: false,
+                busy_plugin: None,
             });
             let mut state = Box::new(State {
                 hwnd: null_mut(),
@@ -503,6 +513,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                     })
                     .map(|hit| hit.action.clone());
                 if let Some(action) = action {
+                    if state.snapshot.busy
+                        && !matches!(action, Action::Close | Action::Previous | Action::Next)
+                    {
+                        return 0;
+                    }
                     match action {
                         Action::Close => {
                             ShowWindow(hwnd, SW_HIDE);
@@ -693,7 +708,16 @@ unsafe fn paint(state: &mut State) {
         let mut icon = |glyph: &str, rect: RECT, tip: &str, action: Action| {
             fill(dc, &rect, crate::visual::theme::palette().hover, unit(10));
             let font = SelectObject(dc, state.icons);
-            SetTextColor(dc, crate::visual::theme::palette().text);
+            let enabled = !state.snapshot.busy
+                || matches!(action, Action::Close | Action::Previous | Action::Next);
+            SetTextColor(
+                dc,
+                if enabled {
+                    crate::visual::theme::palette().text
+                } else {
+                    crate::visual::theme::palette().disabled
+                },
+            );
             let mut target = rect;
             DrawTextW(
                 dc,
@@ -731,7 +755,7 @@ unsafe fn paint(state: &mut State) {
             "文件关联",
             Action::Register,
         );
-        if !state.snapshot.busy {
+        {
             for (glyph, offset, tip, action) in [
                 ("\u{e710}", 144, "添加仓库", Action::Add),
                 (
@@ -744,7 +768,7 @@ unsafe fn paint(state: &mut State) {
                     },
                     Action::Refresh,
                 ),
-                ("\u{e8b5}", 56, "从 .ubplugin 文件强制安装", Action::Local),
+                ("\u{e896}", 56, "从 .ubplugin 文件强制安装", Action::Local),
             ] {
                 icon(
                     glyph,
@@ -940,9 +964,7 @@ unsafe fn paint(state: &mut State) {
                     },
                     crate::visual::theme::palette().muted,
                 );
-                if !state.snapshot.busy
-                    && let Some(candidate) = update
-                {
+                if let Some(candidate) = update {
                     let target = RECT {
                         left: rect.right - unit(56),
                         top: rect.top + unit(16),
@@ -951,10 +973,24 @@ unsafe fn paint(state: &mut State) {
                     };
                     let font = SelectObject(dc, state.icons);
                     let mut glyph = target;
-                    SetTextColor(dc, crate::visual::theme::palette().text);
+                    SetTextColor(
+                        dc,
+                        if state.snapshot.busy {
+                            crate::visual::theme::palette().disabled
+                        } else {
+                            crate::visual::theme::palette().text
+                        },
+                    );
                     DrawTextW(
                         dc,
-                        wide("\u{e72c}").as_ptr(),
+                        wide(
+                            if state.snapshot.busy_plugin.as_deref() == Some(&candidate.entry.id) {
+                                "\u{e72c}"
+                            } else {
+                                "\u{e896}"
+                            },
+                        )
+                        .as_ptr(),
                         -1,
                         &mut glyph,
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
@@ -995,7 +1031,9 @@ unsafe fn paint(state: &mut State) {
                     .plugins
                     .iter()
                     .find(|plugin| plugin.id == candidate.entry.id);
-                let status = if let Some(existing) = existing {
+                let status = if state.snapshot.busy_plugin.as_deref() == Some(&candidate.entry.id) {
+                    format!("{} · 正在下载安装…", candidate.entry.id)
+                } else if let Some(existing) = existing {
                     let source = if existing
                         .source
                         .as_ref()
@@ -1029,7 +1067,7 @@ unsafe fn paint(state: &mut State) {
                     },
                     crate::visual::theme::palette().muted,
                 );
-                if !state.snapshot.busy {
+                {
                     let install = existing.is_none_or(|existing| {
                         precedence(&candidate.entry.version, &existing.version)
                             .is_ok_and(|order| order.is_gt())
@@ -1043,7 +1081,7 @@ unsafe fn paint(state: &mut State) {
                     let font = SelectObject(dc, state.icons);
                     SetTextColor(
                         dc,
-                        if install {
+                        if install && !state.snapshot.busy {
                             crate::visual::theme::palette().text
                         } else {
                             crate::visual::theme::palette().disabled
@@ -1052,7 +1090,16 @@ unsafe fn paint(state: &mut State) {
                     let mut target_text = target;
                     DrawTextW(
                         dc,
-                        wide(if install { "\u{e8b5}" } else { "\u{e73e}" }).as_ptr(),
+                        wide(
+                            if state.snapshot.busy_plugin.as_deref() == Some(&candidate.entry.id) {
+                                "\u{e72c}"
+                            } else if install {
+                                "\u{e896}"
+                            } else {
+                                "\u{e73e}"
+                            },
+                        )
+                        .as_ptr(),
                         -1,
                         &mut target_text,
                         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
@@ -1185,15 +1232,59 @@ pub fn smoke(directory: PathBuf) -> Result<()> {
         state.snapshot = Arc::new(Snapshot {
             sources,
             active: OFFICIAL_ID.into(),
-            entries: vec![],
+            entries: ["Agent Usage", "Everything Search", "Schedule Calendar"]
+                .iter()
+                .enumerate()
+                .map(|(index, name)| Candidate {
+                    entry: CatalogEntry {
+                        id: format!("com.example.plugin{index}"),
+                        name: (*name).into(),
+                        version: "1.2.0".into(),
+                        platform: "windows-x86_64".into(),
+                        host: ">=1.0.0,<2.0.0".into(),
+                        asset: "preview.ubplugin".into(),
+                        sha256: "0".repeat(64),
+                        description: String::new(),
+                    },
+                    source: Source::official(),
+                    asset_id: 0,
+                    download_url: String::new(),
+                    size: 0,
+                    release_tag: String::new(),
+                })
+                .collect(),
             registry: Registry::default(),
             development: development(&root),
             status: "离屏布局检查，不请求网络".into(),
             busy: false,
+            busy_plugin: None,
         });
         state.export = Some(directory.join("plugin-hub-official.bmp"));
         paint(state);
+        let available = state
+            .hits
+            .iter()
+            .filter(|hit| matches!(hit.action, Action::Install(..)))
+            .count();
+        let mut busy = (*state.snapshot).clone();
+        busy.busy = true;
+        busy.busy_plugin = Some("com.example.plugin0".into());
+        state.snapshot = Arc::new(busy);
+        state.export = Some(directory.join("plugin-hub-downloading.bmp"));
+        paint(state);
+        ensure!(
+            available == 3
+                && state
+                    .hits
+                    .iter()
+                    .filter(|hit| matches!(hit.action, Action::Install(..)))
+                    .count()
+                    == available,
+            "Download controls changed layout while busy"
+        );
         let mut snapshot = (*state.snapshot).clone();
+        snapshot.busy = false;
+        snapshot.busy_plugin = None;
         snapshot.active = "installed".into();
         state.snapshot = Arc::new(snapshot);
         state.export = Some(directory.join("plugin-hub-installed.bmp"));
