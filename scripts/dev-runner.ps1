@@ -16,6 +16,12 @@ Set-Location -LiteralPath $root
 $env:CARGO_BUILD_JOBS = "$Jobs"
 $env:CARGO_TARGET_DIR = Join-Path $root 'target/dev-build'
 $env:ULTRA_BAR_LOG_DIR = Join-Path $root 'target/logs'
+if ($Task -eq 'Test') {
+    # Native drawing/window tests share desktop and font resources. Match the
+    # application's single UI thread, including on headless Windows runners.
+    $env:RUST_TEST_THREADS = '1'
+    Write-Host '[dev] test threads=1 (native UI resource isolation)'
+}
 $stateDir = Join-Path $root 'target/dev-watch'
 $runDir = Join-Path $root 'target/dev-run'
 New-Item -ItemType Directory -Force $stateDir, $runDir | Out-Null

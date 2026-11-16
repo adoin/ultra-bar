@@ -2,7 +2,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, VecDeque},
-    mem::{size_of, zeroed},
+    mem::{ManuallyDrop, size_of, zeroed},
     rc::Rc,
 };
 use windows::{
@@ -30,7 +30,11 @@ struct Target {
 }
 thread_local! {
     static TARGETS:RefCell<HashMap<usize,Target>>=RefCell::new(HashMap::new());
-    static RENDERER:RefCell<Option<Renderer>>=const{RefCell::new(None)};
+    // Windows runs TLS destructors under the loader lock. Releasing cached
+    // Direct2D/DXGI objects there can deadlock subsequent renderer creation.
+    // UI-thread caches live until process exit; explicit error resets below
+    // still release their objects normally, outside a TLS destructor.
+    static RENDERER:RefCell<Option<ManuallyDrop<Renderer>>>=const{RefCell::new(None)};
     static COUNTS:std::cell::Cell<(u64,u64)>=const{std::cell::Cell::new((0,0))};
 }
 pub(crate) fn register(
@@ -347,7 +351,7 @@ pub unsafe fn draw_text(
                 )));
             };
             if renderer.is_none() {
-                *renderer = Renderer::new().ok();
+                *renderer = Renderer::new().ok().map(ManuallyDrop::new);
             }
             match renderer.as_mut() {
                 Some(r) => r.render(dc, std::slice::from_raw_parts(value, length), &*rect, flags),
@@ -372,8 +376,10 @@ pub unsafe fn draw_text(
                     c.set((ok, fail + 1));
                 });
                 RENDERER.with(|r| {
-                    if let Ok(mut r) = r.try_borrow_mut() {
-                        *r = None;
+                    if let Ok(mut r) = r.try_borrow_mut()
+                        && let Some(mut renderer) = r.take()
+                    {
+                        ManuallyDrop::drop(&mut renderer);
                     }
                 });
                 DrawTextW(dc, value, count, rect, flags)
