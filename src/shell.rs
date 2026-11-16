@@ -125,6 +125,7 @@ struct State {
     tray_hover: tray::Hover,
     tray_hover_recovery: bool,
     clock_feed: crate::clock_feed::Feed,
+    clock_motion: crate::clock_feed::Motion,
     preview_active: Option<usize>,
     jump_hub: Option<crate::jump_list::Hub>,
     jump_snapshot: Option<crate::jump_list::Snapshot>,
@@ -321,6 +322,7 @@ pub fn run(options: Options) -> Result<()> {
             tray_hover: tray::Hover::default(),
             tray_hover_recovery: true,
             clock_feed: crate::clock_feed::Feed::new(0, CLOCK_UPDATE),
+            clock_motion: crate::clock_feed::Motion::default(),
             gpu_meter: None,
             gpu_meter_failed: false,
             panel_started: vec![],
@@ -2232,6 +2234,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_TIMER => {
+                if w == 6 {
+                    if !state.clock_motion.animating(Instant::now()) || IsWindowVisible(hwnd) == 0 {
+                        KillTimer(hwnd, 6);
+                    }
+                    InvalidateRect(hwnd, null(), 0);
+                    return 0;
+                }
                 if w == 1 {
                     refresh_fullscreen(state);
                     if state.updates.poll() {
@@ -2848,6 +2857,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_DESTROY => {
+                KillTimer(hwnd, 6);
                 state.drag_layer = None;
                 KillTimer(hwnd, 5);
                 state.gpu_meter = None;
@@ -2915,6 +2925,30 @@ unsafe fn paint(state: &mut State) {
                 )
             })
             .unwrap_or_else(|| (state.time.clone(), String::new()));
+        let mut animations: BOOL = 1;
+        SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            (&mut animations as *mut BOOL).cast(),
+            0,
+        );
+        let clock_now = Instant::now();
+        let clock_id = clock_provider.map_or("", |widget| widget.id.as_str());
+        if state.clock_motion.update(
+            clock_id,
+            state.clock_feed.page(clock_id),
+            &clock_text,
+            animations != 0 && IsWindowVisible(state.hwnd) != 0,
+            clock_now,
+        ) {
+            SetTimer(state.hwnd, 6, 20, None);
+        } else {
+            KillTimer(state.hwnd, 6);
+        }
+        let clock_frame = state
+            .clock_motion
+            .frame(clock_now)
+            .map(|(old, phase)| (old.to_owned(), phase));
         let clock_pages = clock_provider
             .map(|widget| {
                 state.clock_feed.width_texts(
@@ -3186,14 +3220,20 @@ unsafe fn paint(state: &mut State) {
                     }
                 }
             }
-            let text = wide(text);
-            DrawTextW(
-                buffer,
-                text.as_ptr(),
-                -1,
-                &mut text_rect,
-                DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
-            );
+            let is_clock = matches!(action, Action::Clock)
+                || matches!(&action, Action::Plugin(id, _) if !clock_id.is_empty() && id == clock_id);
+            if is_clock && let Some((old, phase)) = &clock_frame {
+                crate::clock_feed::draw_slide(buffer, &text_rect, text, old, *phase);
+            } else {
+                let text = wide(text);
+                DrawTextW(
+                    buffer,
+                    text.as_ptr(),
+                    -1,
+                    &mut text_rect,
+                    DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX,
+                );
+            }
             state.hits.push(Hit {
                 rect,
                 action,

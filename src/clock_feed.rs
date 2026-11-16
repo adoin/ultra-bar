@@ -5,12 +5,171 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::mpsc::{self, Receiver},
+    time::{Duration, Instant},
 };
+const SLIDE_DURATION: Duration = Duration::from_millis(240);
+pub unsafe fn draw_slide(
+    dc: windows_sys::Win32::Graphics::Gdi::HDC,
+    rect: &windows_sys::Win32::Foundation::RECT,
+    current: &str,
+    previous: &str,
+    phase: f64,
+) {
+    use windows_sys::Win32::{Foundation::RECT, Graphics::Gdi::*};
+    unsafe {
+        let saved = SaveDC(dc);
+        IntersectClipRect(dc, rect.left, rect.top, rect.right, rect.bottom);
+        let travel = rect.bottom - rect.top;
+        let shift = (travel as f64 * (1. - phase.clamp(0., 1.))).round() as i32;
+        let flags = DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_END_ELLIPSIS | DT_NOPREFIX;
+        let mut incoming = RECT {
+            top: rect.top + shift,
+            bottom: rect.bottom + shift,
+            ..*rect
+        };
+        crate::visual::text::draw_text(
+            dc,
+            crate::visual::wide(current).as_ptr(),
+            -1,
+            &mut incoming,
+            flags,
+        );
+        incoming.top -= travel;
+        incoming.bottom -= travel;
+        crate::visual::text::draw_text(
+            dc,
+            crate::visual::wide(previous).as_ptr(),
+            -1,
+            &mut incoming,
+            flags,
+        );
+        RestoreDC(dc, saved);
+    }
+}
+pub unsafe fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
+    use windows_sys::Win32::{Foundation::RECT, Graphics::Gdi::*};
+    unsafe {
+        std::fs::create_dir_all(directory)?;
+        for dpi in [96, 144, 192] {
+            let unit = |x| x * dpi / 96;
+            let surface = crate::visual::Surface::new(unit(900), unit(64))
+                .ok_or_else(|| anyhow::anyhow!("Cannot create clock preview"))?;
+            let bg = 0x00201612;
+            let brush = CreateSolidBrush(bg);
+            let area = RECT {
+                left: 0,
+                top: 0,
+                right: unit(900),
+                bottom: unit(64),
+            };
+            FillRect(surface.dc, &area, brush);
+            crate::visual::fonts::delete_object(brush);
+            SetBkMode(surface.dc, TRANSPARENT as _);
+            SetTextColor(surface.dc, 0x00ffffff);
+            let font = crate::visual::fonts::create_font(
+                -unit(13),
+                0,
+                0,
+                0,
+                400,
+                0,
+                0,
+                0,
+                DEFAULT_CHARSET as _,
+                OUT_DEFAULT_PRECIS as _,
+                CLIP_DEFAULT_PRECIS as _,
+                CLEARTYPE_NATURAL_QUALITY as _,
+                DEFAULT_PITCH as _,
+                crate::visual::wide("Segoe UI").as_ptr(),
+            );
+            let old_font = SelectObject(surface.dc, font);
+            for (index, progress) in [0., 0.25, 0.5, 0.75, 1.].iter().enumerate() {
+                let rect = RECT {
+                    left: unit(index as i32 * 180 + 8),
+                    top: unit(22),
+                    right: unit((index as i32 + 1) * 180 - 8),
+                    bottom: unit(44),
+                };
+                draw_slide(
+                    surface.dc,
+                    &rect,
+                    "福州 晴 24°C",
+                    "11-16 09:30 周一",
+                    *progress,
+                );
+            }
+            GdiFlush();
+            // Transition glyphs must not leak into the surrounding taskbar.
+            for y in (0..unit(20)).chain(unit(46)..unit(64)) {
+                for x in 0..unit(900) {
+                    anyhow::ensure!(
+                        GetPixel(surface.dc, x, y) == bg,
+                        "Clock text escaped its clip"
+                    );
+                }
+            }
+            surface.save_bmp(&directory.join(format!("clock-slide-{dpi}.bmp")))?;
+            SelectObject(surface.dc, old_font);
+            crate::visual::fonts::delete_object(font);
+        }
+        Ok(())
+    }
+}
+#[derive(Default)]
+pub struct Motion {
+    provider: String,
+    page: usize,
+    current: String,
+    previous: Option<String>,
+    started: Option<Instant>,
+}
+impl Motion {
+    pub fn update(
+        &mut self,
+        provider: &str,
+        page: usize,
+        text: &str,
+        enabled: bool,
+        now: Instant,
+    ) -> bool {
+        if !enabled || !self.animating(now) {
+            self.previous = None;
+            self.started = None;
+        }
+        if provider != self.provider || page != self.page {
+            self.previous = (enabled
+                && provider == self.provider
+                && text != self.current
+                && !self.current.is_empty())
+            .then(|| self.current.clone());
+            self.started = self.previous.as_ref().map(|_| now);
+            self.provider = provider.into();
+            self.page = page;
+        }
+        if text != self.current {
+            self.current = text.into();
+        }
+        self.animating(now)
+    }
+    pub fn animating(&self, now: Instant) -> bool {
+        self.started
+            .is_some_and(|start| now.saturating_duration_since(start) < SLIDE_DURATION)
+    }
+    pub fn frame(&self, now: Instant) -> Option<(&str, f64)> {
+        if !self.animating(now) {
+            return None;
+        }
+        let t = now.saturating_duration_since(self.started?).as_secs_f64()
+            / SLIDE_DURATION.as_secs_f64();
+        Some((self.previous.as_deref()?, 1. - (1. - t).powi(3)))
+    }
+}
 #[derive(Clone, Default, Deserialize)]
 #[serde(default)]
 struct Summary {
     version: u32,
     display: usize,
+    rotation_seconds: u32,
     lunar: String,
     weather: String,
     tooltip: String,
@@ -96,17 +255,25 @@ impl Feed {
             self.reload(widgets);
             self.known = ids;
         }
-        let phase = crate::clock_feed::now() / 6;
-        let rotate = phase != self.phase
-            && self
-                .summaries
-                .values()
-                .any(|s| s.display == 2 && !s.weather.is_empty());
+        let phase = crate::clock_feed::now();
+        let rotate = self.summaries.values().any(|s| {
+            s.display == 2
+                && !s.weather.is_empty()
+                && phase / interval(s) != self.phase / interval(s)
+        });
         self.phase = phase;
         changed || rotate
     }
     pub fn render(&self, id: &str, template: &str, time: &str, pattern: &str) -> (String, String) {
-        self.render_phase(id, template, time, pattern, self.phase)
+        self.render_phase(id, template, time, pattern, self.page(id) as u64)
+    }
+    pub fn page(&self, id: &str) -> usize {
+        self.summaries
+            .get(id)
+            .filter(|s| {
+                s.display == 2 && !s.weather.is_empty() && (now() as i64 - s.updated).abs() <= 180
+            })
+            .map_or(0, |s| (self.phase / interval(s) % 2) as usize)
     }
     /// Reserve the widest page before rotating, including the template and lunar date.
     pub fn width_texts(&self, id: &str, template: &str, time: &str, pattern: &str) -> [String; 2] {
@@ -166,6 +333,13 @@ impl Feed {
         (template.replace("{time}", &text), tip)
     }
 }
+fn interval(summary: &Summary) -> u64 {
+    if (2..=3600).contains(&summary.rotation_seconds) {
+        summary.rotation_seconds as u64
+    } else {
+        6
+    }
+}
 impl Drop for Feed {
     fn drop(&mut self) {
         self.watcher.take();
@@ -203,6 +377,47 @@ fn regional_time(pattern: &str, offset: i32) -> Option<String> {
 mod tests {
     use super::*;
     #[test]
+    fn slide_frames_are_clipped_at_normal_and_high_dpi() {
+        let directory = std::env::var_os("ULTRA_BAR_CLOCK_SLIDE_CAPTURE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                PathBuf::from(format!(
+                    "D:/tmp/ultra-bar-clock-slide-tests-{}",
+                    std::process::id()
+                ))
+            });
+        unsafe {
+            smoke(&directory).unwrap();
+        }
+    }
+    #[test]
+    fn slide_only_runs_for_page_changes_and_stops_after_its_deadline() {
+        let now = Instant::now();
+        let mut motion = Motion::default();
+        assert!(!motion.update("calendar", 0, "09:00", true, now));
+        assert!(!motion.update("calendar", 0, "09:01", true, now));
+        assert!(motion.update("calendar", 1, "晴 16°C", true, now));
+        assert_eq!(motion.frame(now), Some(("09:01", 0.)));
+        let (_, progress) = motion.frame(now + Duration::from_millis(120)).unwrap();
+        assert!(progress > 0.5 && progress < 1.);
+        assert!(!motion.animating(now + SLIDE_DURATION));
+        assert!(motion.frame(now + SLIDE_DURATION).is_none());
+        assert!(!motion.update("another", 0, "09:01", true, now + SLIDE_DURATION));
+        assert!(!motion.update("another", 1, "weather", false, now + SLIDE_DURATION));
+    }
+    #[test]
+    fn intervals_support_legacy_summaries_and_reject_invalid_values() {
+        for (value, expected) in [(0, 6), (1, 6), (2, 2), (12, 12), (3600, 3600), (3601, 6)] {
+            assert_eq!(
+                interval(&Summary {
+                    rotation_seconds: value,
+                    ..Default::default()
+                }),
+                expected
+            );
+        }
+    }
+    #[test]
     fn display_modes_keep_lunar_and_stale_panels_fall_back_to_system_time() {
         let (_, receive) = mpsc::sync_channel(1);
         let mut feed = Feed {
@@ -233,7 +448,7 @@ mod tests {
         let pages = feed.width_texts("calendar", "[{time}]", "fallback", "HH:mm");
         assert!(pages[0].ends_with("正月初一]"));
         assert_eq!(pages[1], "[晴 16°C]");
-        feed.phase = 1;
+        feed.phase = 6;
         assert_eq!(
             pages,
             feed.width_texts("calendar", "[{time}]", "fallback", "HH:mm")
@@ -247,6 +462,15 @@ mod tests {
             feed.render("calendar", "{time}", "fallback", "HH:mm")
                 .0
                 .ends_with("正月初一")
+        );
+        feed.summaries.get_mut("calendar").unwrap().rotation_seconds = 12;
+        feed.phase = 6;
+        assert_eq!(feed.page("calendar"), 0);
+        feed.phase = 12;
+        assert_eq!(feed.page("calendar"), 1);
+        assert_eq!(
+            feed.render("calendar", "{time}", "fallback", "HH:mm").0,
+            "晴 16°C"
         );
         feed.summaries.get_mut("calendar").unwrap().updated = 0;
         assert_eq!(

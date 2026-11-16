@@ -205,6 +205,11 @@ fn run() -> Result<()> {
     if args.get(1).map(String::as_str) == Some("--request-exit") {
         return lifecycle::request_exit();
     }
+    if args.get(1).map(String::as_str) == Some("--clock-slide-smoke") {
+        return unsafe {
+            clock_feed::smoke(&PathBuf::from(args.get(2).context("缺少预览目录")?))
+        };
+    }
     if args.get(1).map(String::as_str) == Some("--task-relief-smoke") {
         return unsafe {
             task_relief::smoke(&PathBuf::from(args.get(2).context("缺少预览目录")?))

@@ -790,6 +790,31 @@ pub struct Tooltips {
     tips: Vec<Tip>,
     strings: Vec<Vec<u16>>,
 }
+// A taskbar and other topmost apps can overtake an existing tooltip. Restore
+// its order when the control shows/repositions it, without taking focus.
+unsafe extern "system" fn tooltip_order(
+    hwnd: HWND,
+    message: u32,
+    w: WPARAM,
+    l: LPARAM,
+    id: usize,
+    _: usize,
+) -> LRESULT {
+    unsafe {
+        if message == WM_WINDOWPOSCHANGING && l != 0 {
+            let position = &mut *(l as *mut WINDOWPOS);
+            if position.flags & SWP_HIDEWINDOW == 0
+                && (position.flags & SWP_SHOWWINDOW != 0 || IsWindowVisible(hwnd) != 0)
+            {
+                position.hwndInsertAfter = HWND_TOPMOST;
+                position.flags = (position.flags & !SWP_NOZORDER) | SWP_NOACTIVATE;
+            }
+        } else if message == WM_NCDESTROY {
+            RemoveWindowSubclass(hwnd, Some(tooltip_order), id);
+        }
+        DefSubclassProc(hwnd, message, w, l)
+    }
+}
 impl Tooltips {
     /// # Safety
     /// The owner must remain live during use, on the current UI thread.
@@ -813,6 +838,7 @@ impl Tooltips {
                 GetModuleHandleW(null()),
                 null(),
             );
+            SetWindowSubclass(window, Some(tooltip_order), 1, 0);
             SendMessageW(window, TTM_SETMAXTIPWIDTH, 0, 640);
             SendMessageW(window, TTM_SETDELAYTIME, TTDT_INITIAL as _, 450);
             SendMessageW(window, TTM_SETDELAYTIME, TTDT_AUTOPOP as _, 15000);
@@ -908,6 +934,85 @@ impl Tooltips {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn showing_a_tooltip_restores_topmost_order_without_taking_focus() {
+        unsafe {
+            let foreground = GetForegroundWindow();
+            let owner = CreateWindowExW(
+                WS_EX_NOACTIVATE,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_POPUP,
+                -32000,
+                -32000,
+                100,
+                40,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!owner.is_null());
+            let tips = Tooltips::new(owner);
+            assert!(!tips.window.is_null());
+            let blocker = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_POPUP,
+                -32000,
+                -32000,
+                100,
+                40,
+                owner,
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            );
+            assert!(!blocker.is_null());
+            ShowWindow(blocker, SW_SHOWNOACTIVATE);
+            // Reproduce a control attempting to show below the taskbar/other apps.
+            SetWindowPos(
+                tips.window,
+                HWND_NOTOPMOST,
+                -32000,
+                -32000,
+                80,
+                24,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+            assert_ne!(
+                GetWindowLongPtrW(tips.window, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST,
+                0
+            );
+            let mut window = GetWindow(blocker, GW_HWNDPREV);
+            let mut above_blocker = false;
+            while !window.is_null() {
+                if window == tips.window {
+                    above_blocker = true;
+                    break;
+                }
+                window = GetWindow(window, GW_HWNDPREV);
+            }
+            assert!(
+                above_blocker,
+                "Tooltip must appear above another topmost window"
+            );
+            assert_eq!(GetForegroundWindow(), foreground);
+            SetWindowPos(
+                tips.window,
+                HWND_NOTOPMOST,
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_HIDEWINDOW,
+            );
+            assert_eq!(IsWindowVisible(tips.window), 0);
+            assert_eq!(GetForegroundWindow(), foreground);
+            DestroyWindow(owner);
+        }
+    }
     #[test]
     fn constant_alpha_gdi_clients_keep_their_own_colors_on_black_and_white_backdrops() {
         unsafe {

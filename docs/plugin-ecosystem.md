@@ -83,3 +83,5 @@ ultra-bar.exe --unregister-plugin-association
 插件仓库的 `scripts/package-plugin.ps1` 生成包、摘要与目录；`.github/workflows/release-plugin.yml` 响应插件命名空间 tag。版本必须同时匹配清单、原生 Cargo 包和 tag。代码／许可／必要资源进入包，开发缓存、测试数据和调试版本不进入正式发行目录。
 
 当前两个远程仓库仍需首次推送本次源码。工作流代码已配置；只有真正推送 tag 并成功生成 GitHub Release，客户端目录才会出现发布项。
+
+时钟扩展的只读 clock.json 摘要可声明 rotation_seconds（2–3600 秒）；缺省或无效值按 6 秒处理。宿主保持轮播各页的最大宽度，仅在页面变化时执行 240 毫秒的向上滑动，完成后停止动画计时，并遵守 Windows 客户区动画偏好。
