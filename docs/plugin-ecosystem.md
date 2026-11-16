@@ -85,3 +85,7 @@ ultra-bar.exe --unregister-plugin-association
 当前两个远程仓库仍需首次推送本次源码。工作流代码已配置；只有真正推送 tag 并成功生成 GitHub Release，客户端目录才会出现发布项。
 
 时钟扩展的只读 clock.json 摘要可声明 rotation_seconds（2–3600 秒）；缺省或无效值按 6 秒处理。宿主保持轮播各页的最大宽度，仅在页面变化时执行 240 毫秒的向上滑动，完成后停止动画计时，并遵守 Windows 客户区动画偏好。
+
+搜索面板：在发起查询时保存 `Panel::query_revision()`，用 `update_query(query, revision, rows, status)` 回填同一请求的结果；不要在旧请求返回时重新读取输入版本。宿主挂载输入和本地输入共享防抖，旧文本或旧版本的结果不会覆盖当前输入。结果邮箱只保留最新快照，不阻塞查询消息泵。
+
+Everything 服务在一轮未完成查询中复用回复窗口，每次替换查询使用独立回复 ID；新查询按照 Everything IPC 的同窗口规则取消旧查询。查询期间处理 Windows 回复和新输入，完成或取消后关闭回复窗口，空闲时阻塞等待命令。协议依据：https://www.voidtools.com/forum/viewtopic.php?t=14938 。

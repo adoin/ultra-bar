@@ -1,4 +1,5 @@
 //! Event-driven glass panel shared by service plugins. Backend work never runs on the UI thread.
+mod search_input;
 pub mod statistics;
 use std::{
     io::BufReader,
@@ -29,14 +30,22 @@ pub struct Row {
     pub detail: String,
     pub path: Option<String>,
 }
+struct SearchOutput {
+    rows: Vec<Row>,
+    status: String,
+    query: Option<String>,
+    revision: u64,
+}
+type RowOutput = std::sync::Arc<std::sync::Mutex<Option<SearchOutput>>>;
 #[derive(Clone)]
 pub struct Panel {
+    query_revision: std::sync::Arc<std::sync::atomic::AtomicU64>,
     pending_settings: std::sync::Arc<std::sync::atomic::AtomicU64>,
     data: std::sync::Arc<std::sync::OnceLock<std::path::PathBuf>>,
     owner: isize,
     statistics: SyncSender<statistics::Dataset>,
     hwnd: isize,
-    output: SyncSender<(Vec<Row>, String)>,
+    output: RowOutput,
     settings: SyncSender<Vec<ultra_bar_native_ui::form::Field>>,
 }
 impl Panel {
@@ -116,7 +125,28 @@ impl Panel {
         }
     }
     pub fn update(&self, rows: Vec<Row>, status: impl Into<String>) {
-        let _ = self.output.try_send((rows, status.into()));
+        self.publish(rows, status.into(), None, 0);
+    }
+    pub fn query_revision(&self) -> u64 {
+        self.query_revision
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub fn update_query(
+        &self,
+        query: &str,
+        revision: u64,
+        rows: Vec<Row>,
+        status: impl Into<String>,
+    ) {
+        self.publish(rows, status.into(), Some(query.into()), revision);
+    }
+    fn publish(&self, rows: Vec<Row>, status: String, query: Option<String>, revision: u64) {
+        *self.output.lock().unwrap_or_else(|e| e.into_inner()) = Some(SearchOutput {
+            rows,
+            status,
+            query,
+            revision,
+        });
         unsafe {
             PostMessageW(self.hwnd as _, WM_APP + 1, 0, 0);
         }
@@ -136,7 +166,8 @@ struct State {
     glass: bool,
     dpi: i32,
     input: SyncSender<Command>,
-    receive: Receiver<(Vec<Row>, String)>,
+    receive: RowOutput,
+    query: search_input::SearchInput,
     rows: Vec<Row>,
     status: String,
     selected: usize,
@@ -161,7 +192,8 @@ pub fn run(
     )?;
     theme::init_from_env();
     let (input, commands) = mpsc::sync_channel(32);
-    let (output, receive) = mpsc::sync_channel(4);
+    let output: RowOutput = Default::default();
+    let receive = output.clone();
     let (settings, settings_rx) = mpsc::sync_channel(2);
     let (statistics, statistics_rx) = mpsc::sync_channel(2);
     unsafe {
@@ -221,6 +253,15 @@ pub fn run(
             dpi,
             input: input.clone(),
             receive,
+            query: {
+                let mut query = search_input::SearchInput::default();
+                if std::env::var_os("ULTRA_BAR_PLUGIN_CAPTURE_DIR").is_some() {
+                    query.dispatched(
+                        std::env::var("ULTRA_BAR_PLUGIN_SMOKE_QUERY").unwrap_or_default(),
+                    );
+                }
+                query
+            },
             rows: vec![],
             status: String::new(),
             selected: 0,
@@ -251,6 +292,7 @@ pub fn run(
         SetLayeredWindowAttributes(hwnd, 0, if state.glass { 238 } else { 255 }, LWA_ALPHA);
         ultra_bar_native_ui::geometry::attach_rounded(hwnd, 18);
         let panel = Panel {
+            query_revision: state.query.source(),
             pending_settings: Default::default(),
             data: Default::default(),
             owner: owner as isize,
@@ -533,7 +575,19 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                             if event.action == "change"
                                 && let Some(query) = event.values.get("query")
                             {
-                                let _ = s.input.try_send(Command::Query(query.clone()));
+                                s.query.change(query.clone());
+                                SetTimer(hwnd, 1, 180, None);
+                                s.rows.clear();
+                                s.selected = 0;
+                                s.scroll = 0;
+                                s.status = if query.trim().is_empty() {
+                                    "搜索软件或文件"
+                                } else {
+                                    "正在搜索…"
+                                }
+                                .into();
+                                sync_tips(s);
+                                InvalidateRect(hwnd, null(), 0);
                             }
                             return 1;
                         }
@@ -606,7 +660,16 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                 0
             }
             m if m == WM_APP + 1 => {
-                while let Ok((rows, status)) = s.receive.try_recv() {
+                let update = s.receive.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some(update) = update {
+                    if s.search
+                        && !s
+                            .query
+                            .accepts(update.query.as_deref().map(|text| (text, update.revision)))
+                    {
+                        return 0;
+                    }
+                    let SearchOutput { rows, status, .. } = update;
                     s.context = None;
                     s.rows = rows;
                     s.status = status;
@@ -686,18 +749,22 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                 0
             }
             WM_COMMAND if (w >> 16) as u32 == EN_CHANGE => {
-                SetTimer(hwnd, 1, 180, None);
+                if s.host.is_null() {
+                    SetTimer(hwnd, 1, 180, None);
+                }
                 0
             }
-            WM_TIMER => {
+            WM_TIMER if w == 1 => {
                 KillTimer(hwnd, 1);
-                let mut text = [0u16; 2048];
-                let n = GetWindowTextW(s.edit, text.as_mut_ptr(), 2048);
+                let query = s.query.take().unwrap_or_else(|| {
+                    let mut text = [0u16; 2048];
+                    let n = GetWindowTextW(s.edit, text.as_mut_ptr(), 2048);
+                    String::from_utf16_lossy(&text[..n.max(0) as usize])
+                });
+                s.query.dispatched(query.clone());
                 s.selected = 0;
                 s.scroll = 0;
-                let _ = s.input.try_send(Command::Query(String::from_utf16_lossy(
-                    &text[..n.max(0) as usize],
-                )));
+                let _ = s.input.try_send(Command::Query(query));
                 0
             }
             WM_KEYDOWN => {
