@@ -89,3 +89,4 @@ ultra-bar.exe --unregister-plugin-association
 搜索面板：在发起查询时保存 `Panel::query_revision()`，用 `update_query(query, revision, rows, status)` 回填同一请求的结果；不要在旧请求返回时重新读取输入版本。宿主挂载输入和本地输入共享防抖，旧文本或旧版本的结果不会覆盖当前输入。结果邮箱只保留最新快照，不阻塞查询消息泵。
 
 Everything 服务在一轮未完成查询中复用回复窗口，每次替换查询使用独立回复 ID；新查询按照 Everything IPC 的同窗口规则取消旧查询。查询期间处理 Windows 回复和新输入，完成或取消后关闭回复窗口，空闲时阻塞等待命令。协议依据：https://www.voidtools.com/forum/viewtopic.php?t=14938 。
+市场目录选择先使用仓库明确标记的最新稳定 Release；若该 Release 没有完整市场目录，再按 published_at（缺省时 created_at）选择最新稳定市场快照。不得按 Release 列表位置或 market/<commit> 的提交哈希顺序选择目录。普通打开仍使用 15 分钟本地缓存，手动刷新跳过缓存。

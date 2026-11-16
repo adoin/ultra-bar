@@ -226,10 +226,43 @@ pub fn verify_installer(path: &std::path::Path, version: &str) -> Result<()> {
 }
 #[derive(Deserialize)]
 struct Release {
+    #[serde(default)]
+    id: u64,
+    #[serde(default)]
+    published_at: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
     tag_name: String,
     draft: bool,
     prerelease: bool,
     assets: Vec<Asset>,
+}
+fn market_asset(release: &Release) -> Option<&Asset> {
+    (!release.draft && !release.prerelease)
+        .then(|| {
+            release
+                .assets
+                .iter()
+                .find(|asset| asset.name == "plugin-market.json")
+        })
+        .flatten()
+}
+fn newest_market(releases: &[Release]) -> Option<&Release> {
+    fn timestamp(r: &Release) -> &str {
+        r.published_at
+            .as_deref()
+            .or(r.created_at.as_deref())
+            .unwrap_or("")
+    }
+    releases
+        .iter()
+        .filter(|r| market_asset(r).is_some())
+        .max_by(|a, b| timestamp(a).cmp(timestamp(b)).then(a.id.cmp(&b.id)))
+}
+fn select_market<'a>(latest: Option<&'a Release>, releases: &'a [Release]) -> Option<&'a Release> {
+    latest
+        .filter(|r| market_asset(r).is_some())
+        .or_else(|| newest_market(releases))
 }
 #[derive(Deserialize)]
 struct MarketCatalog {
@@ -444,35 +477,41 @@ pub fn catalog(paths: &Paths, source: &Source, force: bool) -> Result<Vec<Candid
         },
     };
     let mut releases = vec![];
-    let mut market = None;
-    for page in 1..=10 {
-        let batch: Vec<Release> = serde_json::from_slice(&request(
-            &format!(
-                "repos/{}/releases?per_page=100&page={page}",
-                repository.full_name
-            ),
-            false,
-            8 * 1024 * 1024,
-        )?)?;
-        let done = batch.len() < 100;
-        if let Some(index) = batch
-            .iter()
-            .filter(|r| !r.draft && !r.prerelease)
-            .flat_map(|r| r.assets.iter())
-            .find(|a| a.name == "plugin-market.json")
-        {
-            ensure!(index.size <= 2 * 1024 * 1024, "市场目录过大");
-            let bytes = asset_bytes(&actual, index, 2 * 1024 * 1024)?;
-            market = Some(collect_market(&actual, serde_json::from_slice(&bytes)?)?);
-            break;
+    // Prefer the publisher's explicit latest release. List ordering is not a
+    // market-version contract (snapshot tags contain commit IDs, not SemVer).
+    let latest = request(
+        &format!("repos/{}/releases/latest", repository.full_name),
+        false,
+        2 * 1024 * 1024,
+    )
+    .ok()
+    .and_then(|bytes| serde_json::from_slice::<Release>(&bytes).ok());
+    let mut selected = select_market(latest.as_ref(), &[])
+        .and_then(|r| market_asset(r).map(|asset| (r.tag_name.clone(), asset.clone())));
+    if selected.is_none() {
+        for page in 1..=10 {
+            let batch: Vec<Release> = serde_json::from_slice(&request(
+                &format!(
+                    "repos/{}/releases?per_page=100&page={page}",
+                    repository.full_name
+                ),
+                false,
+                8 * 1024 * 1024,
+            )?)?;
+            let done = batch.len() < 100;
+            releases.extend(batch);
+            if done {
+                break;
+            }
         }
-        releases.extend(batch);
-        if done {
-            break;
-        }
+        selected = select_market(latest.as_ref(), &releases)
+            .and_then(|r| market_asset(r).map(|asset| (r.tag_name.clone(), asset.clone())));
     }
-    let entries = if let Some(entries) = market {
-        entries
+    let market_tag = selected.as_ref().map(|(tag, _)| tag.clone());
+    let entries = if let Some((_, index)) = selected {
+        ensure!(index.size <= 2 * 1024 * 1024, "市场目录过大");
+        let bytes = asset_bytes(&actual, &index, 2 * 1024 * 1024)?;
+        collect_market(&actual, serde_json::from_slice(&bytes)?)?
     } else {
         collect_releases(&actual, releases, |asset| {
             ensure!(asset.size <= 2 * 1024 * 1024, "发布目录过大");
@@ -480,6 +519,11 @@ pub fn catalog(paths: &Paths, source: &Source, force: bool) -> Result<Vec<Candid
             Ok(serde_json::from_slice::<Catalog>(&bytes)?)
         })?
     };
+    ultra_bar_native_ui::diagnostics::event(
+        "plugins",
+        "catalog.loaded",
+        serde_json::json!({"source_id":source.id,"market_tag":market_tag,"entries":entries.len()}),
+    );
     let _guard = CACHE_WRITE
         .lock()
         .map_err(|_| anyhow::anyhow!("更新目录缓存暂不可用"))?;
@@ -772,6 +816,44 @@ fn http(url: &str, limit: usize) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     #[test]
+    fn market_selection_uses_latest_marker_then_publication_time_not_list_order() {
+        let release = |id, tag: &str, date: &str| -> Release {
+            serde_json::from_value(serde_json::json!({
+                "id":id,"tag_name":tag,"published_at":date,"created_at":date,
+                "draft":false,"prerelease":false,
+                "assets":[{"id":id,"name":"plugin-market.json","size":10,"browser_download_url":"https://github.com/example/repo/releases/download/tag/plugin-market.json"}]
+            })).unwrap()
+        };
+        let old = release(30, "market/ffffffff", "2026-11-16T02:47:21Z");
+        let new = release(20, "market/aaaaaaaa", "2026-11-16T07:24:24Z");
+        let mut draft = release(50, "market/draft", "2026-11-17T00:00:00Z");
+        draft.draft = true;
+        let mut preview = release(60, "market/preview", "2026-11-18T00:00:00Z");
+        preview.prerelease = true;
+        let mut list = vec![old, new, draft, preview];
+        assert_eq!(
+            select_market(None, &list).unwrap().tag_name,
+            "market/aaaaaaaa"
+        );
+        list.reverse();
+        assert_eq!(
+            select_market(None, &list).unwrap().tag_name,
+            "market/aaaaaaaa"
+        );
+        let channel = release(10, "market/stable-channel", "2026-11-01T00:00:00Z");
+        assert_eq!(
+            select_market(Some(&channel), &list).unwrap().tag_name,
+            "market/stable-channel"
+        );
+        let mut package = release(70, "com.example.plugin/v2.0.0", "2026-11-19T00:00:00Z");
+        package.assets[0].name = "plugin-catalog.json".into();
+        assert_eq!(
+            select_market(Some(&package), &list).unwrap().tag_name,
+            "market/aaaaaaaa"
+        );
+        assert!(select_market(Some(&package), &[]).is_none());
+    }
+    #[test]
     fn catalog_cache_expires_after_host_changes_or_clock_rollback() {
         let mut cache = Cache {
             at: 1000,
@@ -890,6 +972,9 @@ mod tests {
     fn releases_choose_latest_per_id_and_ignore_drafts_prereleases() {
         let source = Source::official();
         let make = |version: &str, draft, pre| Release {
+            id: 0,
+            published_at: None,
+            created_at: None,
             tag_name: format!("com.example.calendar/v{version}"),
             draft,
             prerelease: pre,
