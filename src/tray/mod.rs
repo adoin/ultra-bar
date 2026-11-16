@@ -208,7 +208,7 @@ impl Host {
                         serde_json::json!({"before_count":current.items.len(),"after_count":items.len(),"keys":items.iter().map(|i|i.key.as_str()).collect::<Vec<_>>()}),
                     );
                 }
-                frames.apply(&mut items);
+                frames.apply_native(&mut items);
                 if hovered
                     .as_ref()
                     .is_some_and(|(key, _, _)| !items.iter().any(|item| &item.key == key))
@@ -322,8 +322,10 @@ impl Host {
         }
     }
     pub fn refresh_if_dirty(&self) {
-        if native::DIRTY.swap(false, Ordering::Relaxed) {
-            let _ = self.sender.try_send(Command::Refresh);
+        if native::DIRTY.swap(false, Ordering::Relaxed)
+            && self.sender.try_send(Command::Refresh).is_err()
+        {
+            native::DIRTY.store(true, Ordering::Relaxed);
         }
     }
     pub fn send(&self, command: Command) {

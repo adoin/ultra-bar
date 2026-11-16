@@ -581,7 +581,14 @@ unsafe extern "system" fn win_event(
             LAST_ACTIVE_WINDOW.store(hwnd as usize, Ordering::Relaxed);
         }
     }
-    tray::event(hwnd, event);
+    if tray::event(hwnd, event) {
+        let owner = unsafe { FindWindowW(wide("UltraBar.Window").as_ptr(), null()) };
+        if !owner.is_null() {
+            unsafe {
+                PostMessageW(owner, TRAY_UPDATE, 0, 0);
+            }
+        }
+    }
     if object == 0 && child == 0 {
         tray::hover_popup_event(hwnd, event);
     }
@@ -2408,6 +2415,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
             TRAY_UPDATE => {
                 let mut offer = false;
                 if let Some(host) = &state.tray_host {
+                    host.refresh_if_dirty();
                     while let Ok(snapshot) = host.updates.try_recv() {
                         offer |= snapshot.offer_import;
                         if snapshot.status != state.tray_snapshot.status

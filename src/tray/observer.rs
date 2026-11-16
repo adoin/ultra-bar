@@ -48,6 +48,7 @@ struct NotifyItem {
 }
 #[derive(Clone)]
 struct Frame {
+    revision: u64,
     pid: u32,
     icon: Option<Arc<Icon>>,
     tip: Option<String>,
@@ -123,6 +124,12 @@ impl Inbox {
         self.active.load(Ordering::Acquire)
     }
     pub fn apply(&self, items: &mut Vec<Item>) -> bool {
+        self.apply_inner(items, false)
+    }
+    pub fn apply_native(&self, items: &mut Vec<Item>) -> bool {
+        self.apply_inner(items, true)
+    }
+    fn apply_inner(&self, items: &mut Vec<Item>, fresh_native: bool) -> bool {
         let frames = {
             let latest = self.latest.lock().unwrap_or_else(|e| e.into_inner());
             self.queued.store(false, Ordering::Release);
@@ -149,7 +156,13 @@ impl Inbox {
             if frame.pid != pid || frame.deleted {
                 continue;
             }
-            if let Some(icon) = &frame.icon {
+            if !fresh_native && frame.revision <= item.observer_revision {
+                continue;
+            }
+            item.observer_revision = frame.revision;
+            if let Some(icon) = &frame.icon
+                && (!fresh_native || !item.native_icon_known)
+            {
                 if icon.fingerprint() != item.icon.fingerprint() {
                     changed = true;
                 }
@@ -204,6 +217,7 @@ impl Inbox {
             latest.insert(
                 (item.owner as usize, item.id),
                 Frame {
+                    revision: self.callbacks.fetch_add(1, Ordering::Relaxed) + 1,
                     pid,
                     icon,
                     tip,
@@ -211,7 +225,6 @@ impl Inbox {
                 },
             );
             drop(latest);
-            self.callbacks.fetch_add(1, Ordering::Relaxed);
             if event != 1 {
                 native::DIRTY.store(true, Ordering::Relaxed);
             }
@@ -365,11 +378,21 @@ unsafe fn listen(inbox: Arc<Inbox>) {
         let connect = || match Connection::connect(inbox.clone()) {
             Ok(connection) => {
                 inbox.active.store(true, Ordering::Release);
+                ultra_bar_native_ui::diagnostics::event(
+                    "tray",
+                    "observer.connected",
+                    serde_json::json!({"explorer_pid":inbox.explorer.load(Ordering::Acquire)}),
+                );
                 eprintln!("[tray] Explorer live icon subscription enabled");
                 Some(connection)
             }
             Err(hr) => {
                 inbox.active.store(false, Ordering::Release);
+                ultra_bar_native_ui::diagnostics::event(
+                    "tray",
+                    "observer.unavailable",
+                    serde_json::json!({"hresult":format!("{hr:#x}")}),
+                );
                 eprintln!("[tray] live subscription unavailable ({hr:#x}); event bridge retained");
                 None
             }
@@ -531,11 +554,22 @@ pub fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
         };
         let mut registration = None;
         let mut stages = vec![];
-        for (index, color) in [Some(0x287cdd), None, Some(0xd34485), None, Some(0x287cdd)]
-            .into_iter()
-            .enumerate()
+        for (index, (color, null_frame)) in [
+            (Some(0x287cdd), false),
+            (None, false),
+            (None, true),
+            (Some(0xd34485), false),
+            (None, true),
+            (Some(0x287cdd), false),
+        ]
+        .into_iter()
+        .enumerate()
         {
-            let icon = fixture_icon(color)?;
+            let icon = if null_frame {
+                Arc::new(Icon::owned(null_mut()))
+            } else {
+                fixture_icon(color)?
+            };
             let expected = icon.fingerprint();
             nid.hIcon = icon.handle();
             let started = Instant::now();
@@ -576,7 +610,7 @@ pub fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            stages.push(serde_json::json!({"stage":index,"transparent_frame":color.is_none(),"received":received,"latency_ms":started.elapsed().as_millis(),"fingerprint":format!("{expected:016x}")}));
+            stages.push(serde_json::json!({"stage":index,"transparent_frame":color.is_none()&&!null_frame,"null_frame":null_frame,"received":received,"latency_ms":started.elapsed().as_millis(),"fingerprint":format!("{expected:016x}")}));
             let current = inbox
                 .latest
                 .lock()
@@ -668,6 +702,7 @@ mod tests {
             inbox.latest.lock().unwrap().insert(
                 (owner, 7),
                 Frame {
+                    revision: 1,
                     pid,
                     icon: Some(avatar.clone()),
                     tip: None,
@@ -676,29 +711,76 @@ mod tests {
             );
             assert!(inbox.apply(&mut items));
             assert_eq!(items[0].icon.fingerprint(), expected);
-            inbox
-                .latest
-                .lock()
-                .unwrap()
-                .get_mut(&(owner, 7))
-                .unwrap()
-                .icon = Some(Arc::new(Icon::owned(null_mut())));
+            {
+                let mut latest = inbox.latest.lock().unwrap();
+                let frame = latest.get_mut(&(owner, 7)).unwrap();
+                frame.revision += 1;
+                frame.icon = Some(Arc::new(Icon::owned(null_mut())));
+            }
             assert!(inbox.apply(&mut items));
             assert_eq!(items.len(), 1);
             assert!(items[0].icon.handle().is_null());
             // A later metadata scan must not substitute the executable logo into the blank blink frame.
             items[0].icon = icon(IDI_WARNING);
-            assert!(inbox.apply(&mut items));
+            items[0].native_icon_known = false;
+            items[0].observer_revision = 0;
+            assert!(inbox.apply_native(&mut items));
             assert!(items[0].icon.handle().is_null());
-            inbox
-                .latest
-                .lock()
-                .unwrap()
-                .get_mut(&(owner, 7))
-                .unwrap()
-                .icon = Some(avatar);
+            {
+                let mut latest = inbox.latest.lock().unwrap();
+                let frame = latest.get_mut(&(owner, 7)).unwrap();
+                frame.revision += 1;
+                frame.icon = Some(avatar);
+            }
             assert!(inbox.apply(&mut items));
             assert_eq!(items[0].icon.fingerprint(), expected);
+            assert_eq!(items[0].uid, 7);
+        }
+    }
+    #[test]
+    fn native_scans_supersede_old_observer_frames_but_accept_new_callbacks() {
+        unsafe {
+            let inbox = inbox();
+            let pid = GetCurrentProcessId();
+            let owner = 0x1234;
+            let avatar = icon(IDI_INFORMATION);
+            inbox.latest.lock().unwrap().insert(
+                (owner, 7),
+                Frame {
+                    revision: 1,
+                    pid,
+                    icon: Some(avatar.clone()),
+                    tip: None,
+                    deleted: false,
+                },
+            );
+            let mut items = vec![native::sample_item(
+                owner,
+                7,
+                pid,
+                Arc::new(Icon::owned(null_mut())),
+            )];
+            assert!(!inbox.apply_native(&mut items));
+            assert!(!inbox.apply(&mut items));
+            assert!(items[0].icon.handle().is_null());
+            {
+                let mut latest = inbox.latest.lock().unwrap();
+                let frame = latest.get_mut(&(owner, 7)).unwrap();
+                frame.revision = 2;
+                frame.icon = Some(Arc::new(Icon::owned(null_mut())));
+            }
+            items = vec![native::sample_item(owner, 7, pid, avatar.clone())];
+            assert!(!inbox.apply_native(&mut items));
+            assert!(!inbox.apply(&mut items));
+            assert_eq!(items[0].icon.fingerprint(), avatar.fingerprint());
+            {
+                let mut latest = inbox.latest.lock().unwrap();
+                let frame = latest.get_mut(&(owner, 7)).unwrap();
+                frame.revision = 3;
+                frame.icon = Some(Arc::new(Icon::owned(null_mut())));
+            }
+            assert!(inbox.apply(&mut items));
+            assert!(items[0].icon.handle().is_null());
             assert_eq!(items[0].uid, 7);
         }
     }
@@ -712,6 +794,7 @@ mod tests {
             inbox.latest.lock().unwrap().insert(
                 (owner, 8),
                 Frame {
+                    revision: 1,
                     pid,
                     icon: Some(icon(IDI_WARNING)),
                     tip: None,
@@ -723,6 +806,7 @@ mod tests {
             inbox.latest.lock().unwrap().insert(
                 (owner, 8),
                 Frame {
+                    revision: 2,
                     pid: pid + 1,
                     icon: Some(icon(IDI_INFORMATION)),
                     tip: None,
@@ -734,6 +818,7 @@ mod tests {
             inbox.latest.lock().unwrap().insert(
                 (owner, 8),
                 Frame {
+                    revision: 3,
                     pid: 0,
                     icon: None,
                     tip: None,

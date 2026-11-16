@@ -24,7 +24,7 @@ pub static SKIPPED: AtomicUsize = AtomicUsize::new(0);
 static BLOCKED_PID: AtomicUsize = AtomicUsize::new(0);
 static BLOCKED_AT: AtomicU64 = AtomicU64::new(0);
 
-pub fn event(hwnd: HWND, event: u32) {
+pub fn event(hwnd: HWND, event: u32) -> bool {
     let hwnd = hwnd as usize;
     if hwnd != 0
         && [
@@ -35,7 +35,7 @@ pub fn event(hwnd: HWND, event: u32) {
         ]
         .contains(&hwnd)
     {
-        DIRTY.store(true, Ordering::Relaxed);
+        return !DIRTY.swap(true, Ordering::AcqRel);
     } else if hwnd != 0 && event == 0x8000 {
         unsafe {
             let mut class = [0u16; 64];
@@ -44,10 +44,11 @@ pub fn event(hwnd: HWND, event: u32) {
                 String::from_utf16_lossy(&class[..length.max(0) as usize]).as_str(),
                 "Shell_TrayWnd" | "NotifyIconOverflowWindow" | "ToolbarWindow32"
             ) {
-                DIRTY.store(true, Ordering::Relaxed);
+                return !DIRTY.swap(true, Ordering::AcqRel);
             }
         }
     }
+    false
 }
 
 #[derive(Clone)]
@@ -133,6 +134,19 @@ impl Icon {
         self.0 as _
     }
 }
+unsafe fn read_icon(raw: HICON, bitmap: i32, executable: &str) -> (std::sync::Arc<Icon>, bool) {
+    unsafe {
+        let mut copy = CopyIcon(raw);
+        // A cleared HICON and image-list slot is a real blank animation frame,
+        // not a missing executable icon. Keep its clickable tray slot intact.
+        let explicit_blank = raw.is_null() && bitmap == -1;
+        let known = !copy.is_null() || explicit_blank;
+        if !known {
+            copy = executable_icon(executable);
+        }
+        (std::sync::Arc::new(Icon::owned(copy)), known)
+    }
+}
 impl Drop for Icon {
     fn drop(&mut self) {
         unsafe {
@@ -151,6 +165,8 @@ pub struct Item {
     pub title: String,
     pub collapsed: bool,
     pub icon: std::sync::Arc<Icon>,
+    pub(super) native_icon_known: bool,
+    pub(super) observer_revision: u64,
     pub endpoint: Endpoint,
 }
 
@@ -470,10 +486,8 @@ pub fn enumerate() -> Result<Vec<Item>> {
                             .to_string_lossy()
                             .into_owned();
                     }
-                    let mut icon = CopyIcon(data.icon as _);
-                    if icon.is_null() {
-                        icon = executable_icon(&executable);
-                    }
+                    let (icon, native_icon_known) =
+                        read_icon(data.icon as _, button.iBitmap, &executable);
                     items.push(Item {
                         key,
                         preference_key,
@@ -481,7 +495,9 @@ pub fn enumerate() -> Result<Vec<Item>> {
                         uid: data.id,
                         title,
                         collapsed,
-                        icon: std::sync::Arc::new(Icon::owned(icon)),
+                        icon,
+                        native_icon_known,
+                        observer_revision: 0,
                         endpoint: Endpoint {
                             toolbar,
                             command: button.idCommand,
@@ -516,6 +532,8 @@ pub(super) fn sample_item(owner: usize, id: u32, pid: u32, icon: std::sync::Arc<
         title: "sample".into(),
         collapsed: false,
         icon,
+        native_icon_known: true,
+        observer_revision: 0,
         endpoint: Endpoint {
             toolbar: 0,
             command: 0,
@@ -928,6 +946,17 @@ pub fn relay(endpoint: &Endpoint, click: Click) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn native_null_icon_frames_remain_blank_and_valid_icons_remain_native() {
+        unsafe {
+            let (blank, known) = read_icon(null_mut(), -1, "");
+            assert!(known && blank.handle().is_null());
+            let (image, known) = read_icon(LoadIconW(null_mut(), IDI_INFORMATION), 3, "");
+            assert!(known && !image.handle().is_null());
+            let (_, known) = read_icon(null_mut(), 3, "");
+            assert!(!known);
+        }
+    }
     #[test]
     fn recovery_restores_saved_toolbar_position_and_removes_properties() {
         unsafe {
