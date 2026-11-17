@@ -822,6 +822,65 @@ mod takeover_tests {
         assert!(PositionGuard::enter().is_some());
     }
     #[test]
+    fn recovery_preserves_overflow_visibility_and_original_style() {
+        unsafe {
+            let class = wide("NotifyIconOverflowWindow");
+            let module = GetModuleHandleW(null());
+            RegisterClassW(&WNDCLASSW {
+                lpfnWndProc: Some(DefWindowProcW),
+                hInstance: module,
+                lpszClassName: class.as_ptr(),
+                ..zeroed()
+            });
+            for visible in [false, true] {
+                let hwnd = CreateWindowExW(
+                    WS_EX_TOOLWINDOW,
+                    class.as_ptr(),
+                    null(),
+                    WS_POPUP,
+                    -32000,
+                    -32000,
+                    20,
+                    20,
+                    null_mut(),
+                    null_mut(),
+                    module,
+                    null(),
+                );
+                assert!(!hwnd.is_null());
+                if visible {
+                    ShowWindow(hwnd, SW_SHOWNA);
+                }
+                let original = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+                SetPropW(
+                    hwnd,
+                    wide(NATIVE_VISIBILITY_PROPERTY).as_ptr(),
+                    (visible as usize + 1) as _,
+                );
+                SetPropW(hwnd, wide(NATIVE_OWNER_PROPERTY).as_ptr(), 7usize as _);
+                hide_native(hwnd);
+                assert_ne!(IsWindowVisible(hwnd), 0);
+                restore_native(&[hwnd], 0, 8);
+                assert_ne!(
+                    GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_LAYERED as isize,
+                    0
+                );
+                restore_native(&[hwnd], 0, 7);
+                assert_eq!(IsWindowVisible(hwnd) != 0, visible);
+                assert_eq!(GetWindowLongPtrW(hwnd, GWL_EXSTYLE), original);
+                for property in [
+                    NATIVE_STYLE_PROPERTY,
+                    NATIVE_OWNER_PROPERTY,
+                    NATIVE_VISIBILITY_PROPERTY,
+                ] {
+                    assert!(GetPropW(hwnd, wide(property).as_ptr()).is_null());
+                }
+                DestroyWindow(hwnd);
+            }
+            UnregisterClassW(class.as_ptr(), module);
+        }
+    }
+    #[test]
     fn recovery_restores_only_its_own_claim_and_stale_watchers_cannot_undo_a_new_claim() {
         unsafe {
             let class = wide("Shell_SecondaryTrayWnd");
@@ -5252,6 +5311,56 @@ pub fn restore_watch(args: &[String]) -> Result<()> {
 // are invisible and pass pointer input through, without invalidating that geometry.
 const NATIVE_STYLE_PROPERTY: &str = "UltraBar.NativeTaskbar.OriginalExStyle.v1";
 const NATIVE_OWNER_PROPERTY: &str = "UltraBar.NativeTaskbar.Owner.v1";
+const NATIVE_VISIBILITY_PROPERTY: &str = "UltraBar.NativeTaskbar.OriginalVisibility.v1";
+
+// Overflow windows can be created after takeover. Claim them lazily, only when
+// the primary Explorer taskbar belongs to this instance. The recovery helper
+// also discovers this claim rather than relying on its startup handle list.
+pub(crate) unsafe fn ensure_native_tray_root(root: HWND) {
+    unsafe {
+        let overflow = FindWindowW(wide("NotifyIconOverflowWindow").as_ptr(), null());
+        let native = FindWindowW(wide("Shell_TrayWnd").as_ptr(), null());
+        let owner = wide(NATIVE_OWNER_PROPERTY);
+        if root.is_null()
+            || root != overflow
+            || native.is_null()
+            || GetPropW(native, owner.as_ptr()) as usize != std::process::id() as usize
+        {
+            return;
+        }
+        let mut root_pid = 0;
+        let mut native_pid = 0;
+        GetWindowThreadProcessId(root, &mut root_pid);
+        GetWindowThreadProcessId(native, &mut native_pid);
+        if root_pid == 0 || root_pid != native_pid {
+            return;
+        }
+        if GetPropW(root, owner.as_ptr()) as usize == std::process::id() as usize
+            && !GetPropW(root, wide(NATIVE_STYLE_PROPERTY).as_ptr()).is_null()
+            && IsWindowVisible(root) != 0
+        {
+            return;
+        }
+        let visibility = wide(NATIVE_VISIBILITY_PROPERTY);
+        if GetPropW(root, visibility.as_ptr()).is_null()
+            && SetPropW(
+                root,
+                visibility.as_ptr(),
+                (IsWindowVisible(root) as usize + 1) as _,
+            ) == 0
+        {
+            return;
+        }
+        if SetPropW(root, owner.as_ptr(), std::process::id() as usize as _) != 0 {
+            hide_native(root);
+            ultra_bar_native_ui::diagnostics::event(
+                "tray",
+                "overflow.geometry_bridge",
+                serde_json::json!({"root":root as usize,"owner":std::process::id(),"visible":IsWindowVisible(root) != 0}),
+            );
+        }
+    }
+}
 unsafe fn hide_native(hwnd: HWND) {
     unsafe {
         let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
@@ -5297,15 +5406,28 @@ unsafe fn restore_native(handles: &[HWND], original: u32, owner: u32) {
             data.lParam = original as _;
             SHAppBarMessage(ABM_SETSTATE, &mut data);
         }
-        for hwnd in handles {
+        let mut handles = handles.to_vec();
+        let overflow = FindWindowW(wide("NotifyIconOverflowWindow").as_ptr(), null());
+        if !overflow.is_null() && !handles.contains(&overflow) {
+            handles.push(overflow);
+        }
+        for hwnd in &handles {
             let hwnd = *hwnd;
             let mut class = [0u16; 128];
             let len = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as _);
             let class = String::from_utf16_lossy(&class[..len.max(0) as usize]);
-            if (class == "Shell_TrayWnd" || class == "Shell_SecondaryTrayWnd")
+            if (class == "Shell_TrayWnd"
+                || class == "Shell_SecondaryTrayWnd"
+                || class == "NotifyIconOverflowWindow")
                 && GetPropW(hwnd, owner_property.as_ptr()) as usize == owner as usize
             {
                 tray::restore_hover_positions(hwnd);
+                let visibility = wide(NATIVE_VISIBILITY_PROPERTY);
+                let saved_visibility = RemovePropW(hwnd, visibility.as_ptr()) as usize;
+                // Hide a previously closed overflow before restoring opacity.
+                if saved_visibility == 1 {
+                    ShowWindow(hwnd, SW_HIDE);
+                }
                 let property = wide(NATIVE_STYLE_PROPERTY);
                 let saved = GetPropW(hwnd, property.as_ptr());
                 if !saved.is_null() {
@@ -5313,7 +5435,9 @@ unsafe fn restore_native(handles: &[HWND], original: u32, owner: u32) {
                     SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (saved as usize - 1) as isize);
                     RemovePropW(hwnd, property.as_ptr());
                 }
-                ShowWindow(hwnd, SW_SHOWNA);
+                if saved_visibility != 1 {
+                    ShowWindow(hwnd, SW_SHOWNA);
+                }
                 RemovePropW(hwnd, owner_property.as_ptr());
             }
         }

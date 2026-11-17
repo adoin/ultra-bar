@@ -710,6 +710,7 @@ impl Drop for HoverTarget {
 unsafe fn align_hover_anchor(toolbar: HWND, data: &TrayData, point: (i32, i32)) {
     unsafe {
         let root = GetAncestor(toolbar, GA_ROOT);
+        crate::shell::ensure_native_tray_root(root);
         // Only touch the invisible Explorer toolbar managed by our takeover guard.
         if GetPropW(
             root,
@@ -910,14 +911,31 @@ pub fn relay(endpoint: &Endpoint, click: Click) -> Result<()> {
         let mut pid = 0;
         GetWindowThreadProcessId(endpoint.owner as _, &mut pid);
         AllowSetForegroundWindow(pid);
-        if matches!(click, Click::Right) && data.version == 4 {
+        // Some clients reject Shell_NotifyIconGetRect's S_FALSE result when
+        // Explorer's overflow is hidden, even though the icon data is valid.
+        crate::shell::ensure_native_tray_root(GetAncestor(endpoint.toolbar as _, GA_ROOT));
+        if matches!(click, Click::Right) {
             let mut point: POINT = zeroed();
             GetCursorPos(&mut point);
-            let (w, l) = notification_packet(data.id, data.version, WM_CONTEXTMENU, point);
-            if PostMessageW(data.owner as _, data.callback, w, l) == 0 {
-                bail!("无法发送版本 4 托盘菜单通知（错误 {}）", GetLastError());
+            // Explorer's hidden toolbar can dismiss its overflow before the
+            // client handles the click. Use the registered callback and actual
+            // protocol version for both modern and legacy context menus.
+            let events: &[u32] = if data.version == 4 {
+                &[WM_CONTEXTMENU]
+            } else {
+                &[WM_RBUTTONDOWN, WM_RBUTTONUP]
+            };
+            for event in events {
+                let (w, l) = notification_packet(data.id, data.version, *event, point);
+                if PostMessageW(data.owner as _, data.callback, w, l) == 0 {
+                    bail!("无法发送托盘菜单通知（错误 {}）", GetLastError());
+                }
             }
-            eprintln!("[tray] context menu version=4 pid={pid} id={}", data.id);
+            ultra_bar_native_ui::diagnostics::event(
+                "tray",
+                "context_menu.relay",
+                serde_json::json!({"pid":pid,"id":data.id,"version":data.version,"callback":data.callback,"toolbar":endpoint.toolbar}),
+            );
             return Ok(());
         }
         if remote.query(endpoint.toolbar as _, TB_GETITEMRECT, index)? == 0 {
