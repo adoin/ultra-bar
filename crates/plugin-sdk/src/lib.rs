@@ -42,6 +42,9 @@ pub struct Page {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum PluginEvent {
+    Uninstall {
+        target: UninstallTarget,
+    },
     Ready,
     Capabilities {
         settings: bool,
@@ -54,6 +57,12 @@ pub enum PluginEvent {
         #[serde(default)]
         select_parent: bool,
     },
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UninstallTarget {
+    Desktop { program: String, arguments: String },
+    Packaged { target: String },
 }
 pub fn read_line(reader: &mut impl BufRead) -> io::Result<Option<String>> {
     let mut bytes = Vec::new();

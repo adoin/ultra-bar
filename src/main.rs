@@ -193,6 +193,11 @@ fn run() -> Result<()> {
             args.get(3).is_some_and(|s| s == "--select-parent"),
         );
     }
+    if args.get(1).map(String::as_str) == Some("--shell-uninstall") {
+        return plugin_services::shell_uninstall(&serde_json::from_str(
+            args.get(2).context("Missing uninstall target")?,
+        )?);
+    }
     if let Some(index) = args.iter().position(|arg| arg == "--profile-root") {
         data_paths::set(args.get(index + 1).context("缺少配置目录")?.into())?;
     }

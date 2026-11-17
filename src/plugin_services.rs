@@ -464,6 +464,14 @@ impl Manager {
                     } if w.shell_open && path.len() <= 32768 => {
                         let _ = open_external(&path, select_parent);
                     }
+                    PluginEvent::Uninstall { target } if w.shell_open => {
+                        let result = uninstall_external(&target);
+                        ultra_bar_native_ui::diagnostics::event(
+                            "search",
+                            "app.uninstall_dispatch",
+                            serde_json::json!({"plugin":w.id,"ok":result.is_ok(),"error":result.err().map(|e|e.to_string())}),
+                        );
+                    }
                     _ => {}
                 }
             }
@@ -704,6 +712,43 @@ pub fn shell_open(path: &str, select_parent: bool) -> Result<()> {
 mod app_target_tests {
     use super::*;
     #[test]
+    fn uninstall_targets_reject_relative_commands_and_foreign_shell_objects() {
+        use ultra_bar_plugin_sdk::UninstallTarget;
+        assert!(
+            validate_uninstall(&UninstallTarget::Desktop {
+                program: "C:\\Program Files\\Example\\uninstall.exe".into(),
+                arguments: r#"/normal "keep spaces""#.into()
+            })
+            .is_ok()
+        );
+        for program in [
+            "cmd.exe",
+            "https://example.com/a.exe",
+            "C:\\test.exe\" /quiet",
+            "C:\\test.bat",
+        ] {
+            assert!(
+                validate_uninstall(&UninstallTarget::Desktop {
+                    program: program.into(),
+                    arguments: String::new()
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            validate_uninstall(&UninstallTarget::Packaged {
+                target: "shell:AppsFolder\\Example_family!App".into()
+            })
+            .is_ok()
+        );
+        assert!(
+            validate_uninstall(&UninstallTarget::Packaged {
+                target: "shell:RecycleBinFolder".into()
+            })
+            .is_err()
+        );
+    }
+    #[test]
     fn allows_only_a_single_packaged_app_target() {
         assert!(packaged_app_target(
             "shell:AppsFolder\\OpenAI.Codex_2p2nqsd0c76g0!App"
@@ -718,4 +763,94 @@ mod app_target_tests {
             assert!(!packaged_app_target(bad));
         }
     }
+}
+
+struct ShellApartment;
+impl Drop for ShellApartment {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Com::CoUninitialize();
+        }
+    }
+}
+pub fn shell_uninstall(target: &ultra_bar_plugin_sdk::UninstallTarget) -> Result<()> {
+    use std::ptr::{null, null_mut};
+    use windows_sys::Win32::System::Com::*;
+    validate_uninstall(target)?;
+    unsafe {
+        let hr = CoInitializeEx(null(), COINIT_APARTMENTTHREADED as u32);
+        anyhow::ensure!(hr >= 0, "Cannot initialize uninstall shell");
+        let _apartment = ShellApartment;
+        match target {
+            ultra_bar_plugin_sdk::UninstallTarget::Desktop { program, arguments } => {
+                let result = ShellExecuteW(
+                    null_mut(),
+                    wide("open").as_ptr(),
+                    wide(program).as_ptr(),
+                    wide(arguments).as_ptr(),
+                    null(),
+                    1,
+                ) as isize;
+                anyhow::ensure!(result > 32, "无法启动卸载程序（错误 {result}）");
+            }
+            ultra_bar_plugin_sdk::UninstallTarget::Packaged { target } => {
+                let mut item = null_mut();
+                let parsed =
+                    SHParseDisplayName(wide(target).as_ptr(), null_mut(), &mut item, 0, null_mut());
+                let mut info: SHELLEXECUTEINFOW = std::mem::zeroed();
+                info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+                // This short-lived helper has no message loop. Complete the
+                // shell verb handoff before releasing COM and exiting.
+                info.fMask = SEE_MASK_INVOKEIDLIST | SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC;
+                let verb = wide("uninstall");
+                info.lpVerb = verb.as_ptr();
+                info.lpIDList = item.cast();
+                info.nShow = 1;
+                let launched = parsed >= 0 && !item.is_null() && ShellExecuteExW(&mut info) != 0;
+                if !item.is_null() {
+                    CoTaskMemFree(item.cast());
+                }
+                if !launched {
+                    let result = ShellExecuteW(
+                        null_mut(),
+                        wide("open").as_ptr(),
+                        wide("ms-settings:appsfeatures").as_ptr(),
+                        null(),
+                        null(),
+                        1,
+                    ) as isize;
+                    anyhow::ensure!(result > 32, "无法打开系统卸载设置（错误 {result}）");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+fn validate_uninstall(target: &ultra_bar_plugin_sdk::UninstallTarget) -> Result<()> {
+    match target {
+        ultra_bar_plugin_sdk::UninstallTarget::Desktop { program, arguments } => ensure!(
+            Path::new(program).is_absolute()
+                && program.to_ascii_lowercase().ends_with(".exe")
+                && !program.contains(['\0', '"', '\r', '\n'])
+                && !arguments.contains('\0')
+                && program.len() + arguments.len() <= 12000,
+            "Invalid uninstall command"
+        ),
+        ultra_bar_plugin_sdk::UninstallTarget::Packaged { target } => {
+            ensure!(packaged_app_target(target), "Invalid packaged application")
+        }
+    }
+    Ok(())
+}
+fn uninstall_external(target: &ultra_bar_plugin_sdk::UninstallTarget) -> Result<()> {
+    validate_uninstall(target)?;
+    let mut command = Command::new(std::env::current_exe()?);
+    if let Some(root) = ultra_bar_native_ui::diagnostics::root() {
+        command.env("ULTRA_BAR_LOG_DIR", root);
+    }
+    command.args(["--shell-uninstall", &serde_json::to_string(target)?]);
+    command
+        .creation_flags(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB)
+        .spawn()?;
+    Ok(())
 }

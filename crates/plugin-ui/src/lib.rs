@@ -21,6 +21,7 @@ pub enum Command {
     Host(HostEvent),
     Query(String),
     Refresh,
+    Uninstall(String),
     SettingsSaved(Vec<String>),
     Ignored,
 }
@@ -29,6 +30,36 @@ pub struct Row {
     pub title: String,
     pub detail: String,
     pub path: Option<String>,
+    pub uninstall: Option<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ResultAction {
+    Open,
+    Locate,
+    Copy,
+    Uninstall,
+}
+impl ResultAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Open => "打开 · Enter",
+            Self::Locate => "打开所在位置 · Ctrl+Enter",
+            Self::Copy => "复制完整路径 · Ctrl+Shift+C",
+            Self::Uninstall => "卸载软件…",
+        }
+    }
+}
+impl Row {
+    fn actions(&self) -> Vec<ResultAction> {
+        let mut actions = vec![];
+        if self.path.is_some() {
+            actions.extend([ResultAction::Open, ResultAction::Locate, ResultAction::Copy]);
+        }
+        if self.uninstall.is_some() {
+            actions.push(ResultAction::Uninstall);
+        }
+        actions
+    }
 }
 struct SearchOutput {
     rows: Vec<Row>,
@@ -416,12 +447,73 @@ unsafe fn copy_path(state: &mut State, hwnd: HWND) {
         CloseClipboard();
     }
 }
+unsafe fn draw_result_icon(
+    dc: HDC,
+    action: ResultAction,
+    x: i32,
+    y: i32,
+    dpi: i32,
+    color: COLORREF,
+) {
+    unsafe {
+        let pen = CreatePen(PS_SOLID, (dpi / 64).max(1), color);
+        let previous_pen = SelectObject(dc, pen);
+        let previous_brush = SelectObject(dc, GetStockObject(NULL_BRUSH));
+        let line = |points: &[(i32, i32)]| {
+            let points: Vec<POINT> = points
+                .iter()
+                .map(|(a, b)| POINT {
+                    x: x + a * dpi / 96,
+                    y: y + b * dpi / 96,
+                })
+                .collect();
+            Polyline(dc, points.as_ptr(), points.len() as i32);
+        };
+        match action {
+            ResultAction::Open => line(&[(5, 2), (16, 9), (5, 16), (5, 2)]),
+            ResultAction::Locate => {
+                line(&[(2, 15), (2, 4), (8, 4), (10, 6), (17, 6), (17, 15), (2, 15)]);
+                line(&[(6, 1), (13, 1), (13, 4)]);
+            }
+            ResultAction::Copy => {
+                line(&[(6, 5), (16, 5), (16, 17), (6, 17), (6, 5)]);
+                line(&[(12, 2), (3, 2), (3, 13)]);
+            }
+            ResultAction::Uninstall => {
+                line(&[(2, 5), (17, 5)]);
+                line(&[(5, 5), (6, 17), (14, 17), (15, 5)]);
+                line(&[(7, 5), (7, 2), (12, 2), (12, 5)]);
+                line(&[(9, 8), (9, 14)]);
+                line(&[(12, 8), (12, 14)]);
+            }
+        }
+        SelectObject(dc, previous_brush);
+        SelectObject(dc, previous_pen);
+        ultra_bar_native_ui::fonts::delete_object(pen);
+    }
+}
 unsafe fn result_action(s: &mut State, hwnd: HWND, index: usize) {
     unsafe {
-        match index {
-            0 => open(s, false),
-            1 => open(s, true),
-            _ => copy_path(s, hwnd),
+        let Some(row) = s.rows.get(s.selected) else {
+            return;
+        };
+        match row.actions().get(index) {
+            Some(ResultAction::Open) => open(s, false),
+            Some(ResultAction::Locate) => open(s, true),
+            Some(ResultAction::Copy) => copy_path(s, hwnd),
+            Some(ResultAction::Uninstall) => {
+                let token = row.uninstall.clone().unwrap();
+                let title = row.title.clone();
+                if ultra_bar_native_ui::dialog::confirm(
+                    hwnd,
+                    "卸载软件",
+                    &format!("卸载“{title}”？"),
+                    "继续卸载",
+                ) {
+                    let _ = s.input.try_send(Command::Uninstall(token));
+                }
+            }
+            None => return,
         };
         InvalidateRect(hwnd, null(), 0);
     }
@@ -461,7 +553,7 @@ unsafe fn sync_tips(s: &mut State) {
                 bounds: (
                     unit(12),
                     unit(top + i as i32 * 62),
-                    unit(390),
+                    unit(502 - row.actions().len() as i32 * 36),
                     unit(top + i as i32 * 62 + 58),
                 ),
                 text: row
@@ -469,23 +561,18 @@ unsafe fn sync_tips(s: &mut State) {
                     .clone()
                     .unwrap_or_else(|| format!("{}\n{}", row.title, row.detail)),
             });
-            if row.path.is_some() {
-                for (n, title) in [
-                    "打开 · Enter",
-                    "打开所在位置 · Ctrl+Enter",
-                    "复制完整路径 · Ctrl+Shift+C",
-                ]
-                .iter()
-                .enumerate()
-                {
+            let actions = row.actions();
+            {
+                let left = 502 - actions.len() as i32 * 36;
+                for (n, action) in actions.iter().enumerate() {
                     tips.push(Tip {
                         bounds: (
-                            unit(394 + n as i32 * 36),
+                            unit(left + n as i32 * 36),
                             unit(top + i as i32 * 62),
-                            unit(430 + n as i32 * 36),
+                            unit(left + 36 + n as i32 * 36),
                             unit(top + i as i32 * 62 + 58),
                         ),
-                        text: (*title).into(),
+                        text: action.label().into(),
                     });
                 }
             }
@@ -578,6 +665,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                                 s.query.change(query.clone());
                                 SetTimer(hwnd, 1, 180, None);
                                 s.rows.clear();
+                                s.context = None;
                                 s.selected = 0;
                                 s.scroll = 0;
                                 s.status = if query.trim().is_empty() {
@@ -816,7 +904,8 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                 let x = l as i16 as i32 * 96 / s.dpi;
                 let y = (l >> 16) as i16 as i32 * 96 / s.dpi;
                 if let Some((left, top)) = s.context.take() {
-                    if x >= left && x < left + 190 && y >= top && y < top + 120 {
+                    let count = s.rows.get(s.selected).map_or(0, |r| r.actions().len());
+                    if x >= left && x < left + 240 && y >= top && y < top + count as i32 * 40 {
                         result_action(s, hwnd, ((y - top) / 40) as usize);
                     }
                     InvalidateRect(hwnd, null(), 0);
@@ -844,8 +933,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                     if y >= top && y < top + 310 {
                         s.selected = (s.scroll + ((y - top) / 62) as usize)
                             .min(s.rows.len().saturating_sub(1));
-                        if (394..502).contains(&x) {
-                            result_action(s, hwnd, ((x - 394) / 36) as usize);
+                        let left = s
+                            .rows
+                            .get(s.selected)
+                            .map_or(502, |r| 502 - r.actions().len() as i32 * 36);
+                        if (left..502).contains(&x) {
+                            result_action(s, hwnd, ((x - left) / 36) as usize);
                         } else if msg == WM_LBUTTONDBLCLK {
                             open(s, false);
                         }
@@ -859,9 +952,12 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                 let y = (l >> 16) as i16 as i32 * 96 / s.dpi;
                 if (94..404).contains(&y) {
                     let selected = s.scroll + ((y - 94) / 62) as usize;
-                    if s.rows.get(selected).is_some_and(|r| r.path.is_some()) {
+                    if let Some(row) = s.rows.get(selected).filter(|r| !r.actions().is_empty()) {
                         s.selected = selected;
-                        s.context = Some((x.clamp(12, 318), y.clamp(94, 292)));
+                        s.context = Some((
+                            x.clamp(12, 268),
+                            y.clamp(94, 404 - row.actions().len() as i32 * 40),
+                        ));
                     }
                 }
                 InvalidateRect(hwnd, null(), 0);
@@ -935,7 +1031,7 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                     let top = if s.search { 94 } else { 54 };
                     for (i, row) in s.rows.iter().enumerate().skip(s.scroll).take(5) {
                         let y = top + (i - s.scroll) as i32 * 62;
-                        if i == s.selected && row.path.is_some() {
+                        if i == s.selected && !row.actions().is_empty() {
                             let brush = CreateSolidBrush(palette.selection);
                             let old = SelectObject(dc, brush);
                             let pen = SelectObject(dc, GetStockObject(NULL_PEN));
@@ -952,14 +1048,20 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                             SelectObject(dc, pen);
                             ultra_bar_native_ui::fonts::delete_object(brush);
                         }
-                        text(&row.title, 22, y + 3, 360, 26, palette.text);
-                        text(&row.detail, 22, y + 29, 360, 23, palette.muted);
-                        if row.path.is_some() {
-                            SelectObject(dc, s.icons);
-                            for (n, glyph) in
-                                ["\u{e8a7}", "\u{e8b7}", "\u{e8c8}"].iter().enumerate()
-                            {
-                                text(glyph, 400 + n as i32 * 36, y + 12, 24, 28, palette.muted);
+                        let actions = row.actions();
+                        let left = 502 - actions.len() as i32 * 36;
+                        text(&row.title, 22, y + 3, left - 30, 26, palette.text);
+                        text(&row.detail, 22, y + 29, left - 30, 23, palette.muted);
+                        {
+                            for (n, action) in actions.iter().enumerate() {
+                                draw_result_icon(
+                                    dc,
+                                    *action,
+                                    unit(left + n as i32 * 36 + 8),
+                                    unit(y + 20),
+                                    s.dpi,
+                                    palette.muted,
+                                );
                             }
                             SelectObject(dc, s.font);
                         }
@@ -979,17 +1081,32 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                             dc,
                             unit(x),
                             unit(y),
-                            unit(x + 190),
-                            unit(y + 120),
+                            unit(x + 240),
+                            unit(
+                                y + s.rows.get(s.selected).map_or(0, |r| r.actions().len()) as i32
+                                    * 40,
+                            ),
                             unit(12),
                             unit(12),
                         );
                         SelectObject(dc, b);
                         SelectObject(dc, pen);
-                        for (i, label) in
-                            ["打开", "打开所在位置", "复制完整路径"].iter().enumerate()
+                        for (i, action) in s
+                            .rows
+                            .get(s.selected)
+                            .map(|r| r.actions())
+                            .unwrap_or_default()
+                            .iter()
+                            .enumerate()
                         {
-                            text(label, x + 16, y + i as i32 * 40, 164, 40, palette.text);
+                            text(
+                                action.label(),
+                                x + 16,
+                                y + i as i32 * 40,
+                                212,
+                                40,
+                                palette.text,
+                            );
                         }
                     }
                     // Constant alpha keeps native EDIT/caret rendering; per-pixel layered updates
@@ -1016,6 +1133,38 @@ unsafe extern "system" fn proc(hwnd: HWND, msg: u32, w: usize, l: isize) -> LRES
                 0
             }
             _ => DefWindowProcW(hwnd, msg, w, l),
+        }
+    }
+}
+
+#[cfg(test)]
+mod result_action_tests {
+    use super::*;
+    #[test]
+    fn files_cannot_uninstall_and_unlaunchable_apps_still_offer_uninstall() {
+        let file = Row {
+            path: Some("C:\\photo.png".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            file.actions(),
+            [ResultAction::Open, ResultAction::Locate, ResultAction::Copy]
+        );
+        let app = Row {
+            uninstall: Some("registered-id".into()),
+            ..Default::default()
+        };
+        assert_eq!(app.actions(), [ResultAction::Uninstall]);
+        let installed = Row {
+            path: file.path,
+            uninstall: app.uninstall,
+            ..Default::default()
+        };
+        assert_eq!(installed.actions().len(), 4);
+        for row in [Row::default(), installed] {
+            let left = 502 - row.actions().len() as i32 * 36;
+            assert!(left >= 358);
+            assert_eq!(left + row.actions().len() as i32 * 36, 502);
         }
     }
 }

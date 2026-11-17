@@ -914,13 +914,18 @@ pub fn relay(endpoint: &Endpoint, click: Click) -> Result<()> {
         // Some clients reject Shell_NotifyIconGetRect's S_FALSE result when
         // Explorer's overflow is hidden, even though the icon data is valid.
         crate::shell::ensure_native_tray_root(GetAncestor(endpoint.toolbar as _, GA_ROOT));
-        if matches!(click, Click::Right) {
+        if matches!(click, Click::Right | Click::Double) || data.version != 4 {
             let mut point: POINT = zeroed();
             GetCursorPos(&mut point);
             // Explorer's hidden toolbar can dismiss its overflow before the
             // client handles the click. Use the registered callback and actual
-            // protocol version for both modern and legacy context menus.
-            let events: &[u32] = if data.version == 4 {
+            // protocol version for context menus, double clicks and legacy
+            // button-down clients such as Clash Verge.
+            let events: &[u32] = if matches!(click, Click::Left) {
+                &[WM_LBUTTONDOWN, WM_LBUTTONUP]
+            } else if matches!(click, Click::Double) {
+                &[WM_LBUTTONDBLCLK, WM_LBUTTONUP]
+            } else if data.version == 4 {
                 &[WM_CONTEXTMENU]
             } else {
                 &[WM_RBUTTONDOWN, WM_RBUTTONUP]
@@ -928,13 +933,13 @@ pub fn relay(endpoint: &Endpoint, click: Click) -> Result<()> {
             for event in events {
                 let (w, l) = notification_packet(data.id, data.version, *event, point);
                 if PostMessageW(data.owner as _, data.callback, w, l) == 0 {
-                    bail!("无法发送托盘菜单通知（错误 {}）", GetLastError());
+                    bail!("无法发送托盘操作通知（错误 {}）", GetLastError());
                 }
             }
             ultra_bar_native_ui::diagnostics::event(
                 "tray",
-                "context_menu.relay",
-                serde_json::json!({"pid":pid,"id":data.id,"version":data.version,"callback":data.callback,"toolbar":endpoint.toolbar}),
+                "click.relay",
+                serde_json::json!({"click":match click {Click::Double=>"double",Click::Left=>"left",Click::Right=>"right"},"pid":pid,"id":data.id,"version":data.version,"callback":data.callback,"toolbar":endpoint.toolbar}),
             );
             return Ok(());
         }
