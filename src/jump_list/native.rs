@@ -207,6 +207,146 @@ fn shell_item(path: &Path) -> Option<Object> {
         .then_some(Object(pointer))
     }
 }
+fn item_name(item: &Object, kind: i32) -> Option<String> {
+    unsafe {
+        let name: unsafe extern "system" fn(*mut c_void, i32, *mut *mut u16) -> i32 =
+            std::mem::transmute(item.method(5));
+        let mut value = null_mut();
+        (name(item.0, kind, &mut value) >= 0 && !value.is_null()).then(|| owned_text(value))
+    }
+}
+
+fn same_folder(left: &str, right: &str) -> bool {
+    crate::task_apps::normalize(left).trim_end_matches('\\')
+        == crate::task_apps::normalize(right).trim_end_matches('\\')
+}
+
+fn is_folder_pinned(path: &str) -> Result<bool> {
+    let folders = pinned(super::EXPLORER_APP_ID)
+        .ok_or_else(|| anyhow::anyhow!("无法读取 Windows 固定列表"))?;
+    unsafe {
+        let count: unsafe extern "system" fn(*mut c_void, *mut u32) -> i32 =
+            std::mem::transmute(folders.method(3));
+        let get: unsafe extern "system" fn(*mut c_void, u32, *const GUID, *mut *mut c_void) -> i32 =
+            std::mem::transmute(folders.method(4));
+        let mut length = 0;
+        ensure!(
+            count(folders.0, &mut length) >= 0,
+            "无法读取 Windows 固定列表"
+        );
+        for index in 0..length {
+            let mut pointer = null_mut();
+            if get(folders.0, index, &ITEM, &mut pointer) >= 0 && !pointer.is_null() {
+                let item = Object(pointer);
+                if item_name(&item, SIGDN_DESKTOPABSOLUTEPARSING)
+                    .is_some_and(|name| same_folder(&name, path))
+                {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+pub(super) fn pin_folder(path: &Path, owner: HWND) -> Result<()> {
+    ensure!(
+        path.is_absolute() && path.is_dir(),
+        "文件夹不可用：{}",
+        path.display()
+    );
+    let _apartment = Apartment::new()?;
+    let path = path.to_string_lossy();
+    if is_folder_pinned(&path)? {
+        return Ok(());
+    }
+    shell_pin_verb(owner, "pintohome", Some(&path), null_mut())?;
+    ensure!(is_folder_pinned(&path)?, "Windows 未固定此文件夹：{path}");
+    Ok(())
+}
+
+pub(super) fn unpin_folder(path: &str, owner: HWND) -> Result<()> {
+    let _apartment = Apartment::new()?;
+    if !is_folder_pinned(path)? {
+        return Ok(());
+    }
+    let home = shell_item(Path::new("shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}"))
+        .ok_or_else(|| anyhow::anyhow!("无法打开 Windows 快速访问"))?;
+    unsafe {
+        let bind: unsafe extern "system" fn(
+            *mut c_void,
+            *mut c_void,
+            *const GUID,
+            *const GUID,
+            *mut *mut c_void,
+        ) -> i32 = std::mem::transmute(home.method(3));
+        let mut pointer = null_mut();
+        ensure!(
+            bind(
+                home.0,
+                null_mut(),
+                &GUID::from_u128(0x94f60519_2850_4924_aa5a_d15e84868039),
+                &GUID::from_u128(0x70629033_e363_4a28_a567_0db78006e6d7),
+                &mut pointer
+            ) >= 0
+                && !pointer.is_null(),
+            "无法读取 Windows 快速访问"
+        );
+        let items = Object(pointer);
+        let next: unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void, *mut u32) -> i32 =
+            std::mem::transmute(items.method(3));
+        for _ in 0..4096 {
+            let mut pointer = null_mut();
+            let mut fetched = 0;
+            ensure!(
+                next(items.0, 1, &mut pointer, &mut fetched) >= 0,
+                "无法读取 Windows 快速访问"
+            );
+            if fetched == 0 || pointer.is_null() {
+                anyhow::bail!("找不到要取消固定的文件夹：{path}");
+            }
+            let item = Object(pointer);
+            let matches = [SIGDN_FILESYSPATH, SIGDN_DESKTOPABSOLUTEPARSING]
+                .into_iter()
+                .any(|kind| item_name(&item, kind).is_some_and(|name| same_folder(&name, path)));
+            if !matches {
+                continue;
+            }
+            let mut pidl = null_mut();
+            ensure!(
+                SHGetIDListFromObject(item.0, &mut pidl) >= 0 && !pidl.is_null(),
+                "无法定位快速访问条目"
+            );
+            let result = shell_pin_verb(owner, "unpinfromhome", None, pidl.cast());
+            CoTaskMemFree(pidl.cast());
+            result?;
+            ensure!(!is_folder_pinned(path)?, "Windows 未取消固定：{path}");
+            return Ok(());
+        }
+    }
+    anyhow::bail!("找不到要取消固定的文件夹：{path}")
+}
+
+fn shell_pin_verb(owner: HWND, verb: &str, path: Option<&str>, pidl: *mut c_void) -> Result<()> {
+    let verb = wide(verb);
+    let path = path.map(wide);
+    unsafe {
+        let mut info: SHELLEXECUTEINFOW = zeroed();
+        info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        info.fMask = SEE_MASK_INVOKEIDLIST | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+        info.hwnd = owner;
+        info.lpVerb = verb.as_ptr();
+        info.lpFile = path.as_ref().map_or(null(), |path| path.as_ptr());
+        info.lpIDList = pidl;
+        info.nShow = SW_SHOWNORMAL;
+        ensure!(
+            ShellExecuteExW(&mut info) != 0,
+            "Windows 固定操作失败（{}）",
+            GetLastError()
+        );
+    }
+    Ok(())
+}
 fn resolver() -> Option<Object> {
     Object::create(
         GUID::from_u128(0x660b90c8_73a9_4b58_8cae_355b7f55341b),
@@ -366,7 +506,12 @@ fn pinned(app_id: &str) -> Option<Object> {
             *mut *mut c_void,
         ) -> i32 = std::mem::transmute(list.method(5));
         let mut pointer = null_mut();
-        (get(list.0, 0, 10, 1, &ARRAY, &mut pointer) >= 0 && !pointer.is_null())
+        let limit = if app_id == super::EXPLORER_APP_ID {
+            256
+        } else {
+            10
+        };
+        (get(list.0, 0, limit, 1, &ARRAY, &mut pointer) >= 0 && !pointer.is_null())
             .then_some(Object(pointer))
     }
 }
@@ -486,8 +631,13 @@ fn append(array: Option<Object>, category: &str, query: &Query, entries: &mut Ve
         if count(array.0, &mut length) < 0 {
             return;
         }
-        for index in 0..length.min(32) {
-            if entries.len() >= 32 {
+        let limit = if query.app_id.as_deref() == Some(super::EXPLORER_APP_ID) {
+            256
+        } else {
+            32
+        };
+        for index in 0..length.min(limit) {
+            if entries.len() >= limit as usize {
                 break;
             }
             let mut pointer = null_mut();

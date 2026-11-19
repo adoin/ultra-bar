@@ -14,6 +14,11 @@ use std::{
 };
 use windows_sys::Win32::{Foundation::HWND, UI::WindowsAndMessaging::PostMessageW};
 pub const UPDATE: u32 = 0x8008;
+pub const EXPLORER_APP_ID: &str = "Microsoft.Windows.Explorer";
+
+pub fn pin_explorer_folder(path: &Path, owner: HWND) -> Result<()> {
+    native::pin_folder(path, owner)
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Query {
     pub hwnd: usize,
@@ -84,6 +89,14 @@ pub struct Snapshot {
     _lease: Arc<Lease>,
 }
 impl Snapshot {
+    pub fn unpin_explorer_folder(&self, index: usize, owner: HWND) -> Result<()> {
+        let entry = self.wire.entries.get(index).context("快捷操作已失效")?;
+        ensure!(
+            self.wire.app_id.as_deref() == Some(EXPLORER_APP_ID) && entry.category == "已固定",
+            "该条目不在 Windows 固定列表中"
+        );
+        native::unpin_folder(&entry.icon, owner)
+    }
     pub fn invoke(&self, index: usize, owner: HWND) -> Result<()> {
         native::invoke(
             self.wire.entries.get(index).context("快捷操作已失效")?,
@@ -136,7 +149,8 @@ impl Hub {
                     continue;
                 }
                 let key = query.key();
-                let result = if let Some((time, snapshot)) = cache.get(&key)
+                let result = if query.app_id.as_deref() != Some(EXPLORER_APP_ID)
+                    && let Some((time, snapshot)) = cache.get(&key)
                     && time.elapsed() < Duration::from_secs(5)
                 {
                     Ok(snapshot.clone())
@@ -249,7 +263,12 @@ fn read_isolated(
         "Jump List result too large"
     );
     let wire: Wire = serde_json::from_slice(&std::fs::read(&query.output)?)?;
-    ensure!(wire.entries.len() <= 32, "Too many Jump List entries");
+    let limit = if query.app_id.as_deref() == Some(EXPLORER_APP_ID) {
+        256
+    } else {
+        32
+    };
+    ensure!(wire.entries.len() <= limit, "Too many Jump List entries");
     for entry in &wire.entries {
         ensure!(
             entry.path.parent() == Some(root.as_path())
@@ -322,6 +341,9 @@ pub fn valid_pidl(bytes: &[u8]) -> bool {
     false
 }
 pub fn diagnose(directory: &Path, args: &[String]) -> Result<()> {
+    if args.iter().any(|arg| arg == "--verify-explorer-pin") {
+        return verify_explorer_pin(directory);
+    }
     let value = |name: &str| {
         args.iter()
             .position(|arg| arg == name)
@@ -343,6 +365,45 @@ pub fn diagnose(directory: &Path, args: &[String]) -> Result<()> {
     )?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+fn verify_explorer_pin(directory: &Path) -> Result<()> {
+    ensure!(directory.is_absolute(), "需要绝对测试路径");
+    std::fs::create_dir_all(directory)?;
+    let title = format!("Ultra Bar 固定测试 {}", std::process::id());
+    let folder = directory.join(&title);
+    std::fs::create_dir(&folder)?;
+    let owner = std::ptr::null_mut();
+    let result = (|| {
+        pin_explorer_folder(&folder, owner)?;
+        pin_explorer_folder(&folder, owner)?;
+        let mut query = Query::new(0, 0, String::new(), None);
+        query.app_id = Some(EXPLORER_APP_ID.into());
+        let read = |tag| read_isolated(query.clone(), directory, tag, &AtomicU64::new(tag));
+        let snapshot = read(1)?;
+        let mut matches = snapshot
+            .wire
+            .entries
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.category == "已固定" && entry.title == title);
+        let (index, _) = matches.next().context("Windows 跳转列表缺少测试文件夹")?;
+        ensure!(matches.next().is_none(), "Windows 跳转列表存在重复项");
+        snapshot.unpin_explorer_folder(index, owner)?;
+        ensure!(
+            read(2)?
+                .wire
+                .entries
+                .iter()
+                .all(|entry| entry.category != "已固定" || entry.title != title),
+            "Windows 跳转列表仍保留测试文件夹"
+        );
+        ensure!(folder.is_dir(), "测试文件夹被删除");
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = native::unpin_folder(&folder.to_string_lossy(), owner);
+    }
+    result
 }
 pub fn smoke(directory: &Path) -> Result<()> {
     ensure!(directory.is_absolute(), "Output directory must be absolute");

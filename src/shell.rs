@@ -1373,6 +1373,35 @@ fn add_shortcuts(state: &mut State, paths: Vec<std::path::PathBuf>) {
     }
     edit_script_aliases(state, scripts);
 }
+fn drop_shortcuts(state: &mut State, point: Option<POINT>, mut paths: Vec<std::path::PathBuf>) {
+    let on_explorer = point.is_some_and(|point| {
+        let Some(Action::Task(id)) = hit_action(state, point.x, point.y) else {
+            return false;
+        };
+        state
+            .tasks
+            .iter()
+            .any(|task| task.id == id && crate::task_apps::is_explorer(&task.executable))
+    });
+    if on_explorer {
+        let mut errors = Vec::new();
+        paths.retain(|path| {
+            if !path.is_absolute() || !path.is_dir() {
+                return true;
+            }
+            if let Err(error) = crate::jump_list::pin_explorer_folder(path, state.hwnd) {
+                errors.push(format!("{}：{error:#}", path.display()));
+            }
+            false
+        });
+        if !errors.is_empty() {
+            app_error(state.hwnd, &anyhow::anyhow!(errors.join("\n")));
+        }
+    }
+    if !paths.is_empty() {
+        add_shortcuts(state, paths);
+    }
+}
 fn edit_script_aliases(state: &mut State, scripts: Vec<crate::task_apps::Shortcut>) {
     use ultra_bar_plugin_sdk::editors::{Field, Form, Kind};
     // One scrollable form per batch; closing it keeps the saved original names.
@@ -1523,7 +1552,9 @@ unsafe fn context_items(state: &State, id: usize) -> Vec<crate::task_popup::Item
             ),
         ];
         let foreground = GetAncestor(effective_foreground(), GA_ROOTOWNER);
-        if crate::task_apps::is_explorer(&task.executable) {
+        let explorer = crate::task_apps::is_explorer(&task.executable);
+        let mut folders = Vec::new();
+        if explorer {
             items.insert(
                 0,
                 crate::task_popup::Item::command(
@@ -1577,6 +1608,7 @@ unsafe fn context_items(state: &State, id: usize) -> Vec<crate::task_popup::Item
         }
         if let Some(snapshot) = &state.jump_snapshot {
             let mut native = vec![];
+            let mut pinned_folders = vec![];
             let mut category = String::new();
             for (index, entry) in snapshot.wire.entries.iter().enumerate() {
                 let path = std::path::Path::new(&entry.icon);
@@ -1586,12 +1618,24 @@ unsafe fn context_items(state: &State, id: usize) -> Vec<crate::task_popup::Item
                             .iter()
                             .any(|kind| ext.eq_ignore_ascii_case(kind))
                     });
-                let icon = local
-                    .then(|| AppIcon::from_resource(&entry.icon, entry.icon_index, state.dpi, 24));
+                let icon = if explorer && entry.kind == "pidl" && path.is_absolute() {
+                    Some(AppIcon::from_file(&entry.icon, state.dpi, 24))
+                } else {
+                    local.then(|| {
+                        AppIcon::from_resource(&entry.icon, entry.icon_index, state.dpi, 24)
+                    })
+                };
                 let mut item = crate::task_popup::Item::new(
-                    crate::task_popup::Target::Jump {
-                        generation: state.jump_generation,
-                        index,
+                    if explorer && entry.category == "已固定" {
+                        crate::task_popup::Target::ExplorerFolder {
+                            generation: state.jump_generation,
+                            index,
+                        }
+                    } else {
+                        crate::task_popup::Target::Jump {
+                            generation: state.jump_generation,
+                            index,
+                        }
                     },
                     entry.title.clone(),
                     icon.as_ref()
@@ -1600,27 +1644,34 @@ unsafe fn context_items(state: &State, id: usize) -> Vec<crate::task_popup::Item
                     false,
                 );
                 item.tooltip = Some(format!("{} · {}", entry.category, entry.title));
+                item.scroll_section = explorer;
+                if explorer && entry.category == "已固定" {
+                    pinned_folders.push(item);
+                    continue;
+                }
                 item.separator_before = !category.is_empty() && category != entry.category;
                 category = entry.category.clone();
                 native.push(item);
             }
-            if !native.is_empty() {
-                if items
-                    .first()
-                    .is_some_and(|item| item.target == crate::task_popup::Target::ThisPc)
-                {
-                    let navigation = items.remove(0);
-                    native.insert(0, navigation);
-                    if let Some(first) = native.get_mut(1) {
-                        first.separator_before = true;
-                    }
+            if explorer {
+                pinned_folders.append(&mut folders);
+                if let Some(first) = native.first_mut() {
+                    first.separator_before = !pinned_folders.is_empty();
                 }
+                pinned_folders.append(&mut native);
+                folders = pinned_folders;
+            } else if !native.is_empty() {
                 if let Some(first) = items.first_mut() {
                     first.separator_before = true;
                 }
                 native.extend(items);
                 items = native;
             }
+        }
+        if explorer && !folders.is_empty() {
+            folders[0].separator_before = true;
+            items[1].separator_before = true;
+            items.splice(1..1, folders);
         }
         items
     }
@@ -1678,6 +1729,30 @@ unsafe fn show_scripts(state: &mut State, id: usize, context: bool) {
         );
     }
 }
+fn migrate_explorer_folders(state: &mut State) {
+    if state.isolated || state.settings.explorer_folders.is_empty() {
+        return;
+    }
+    let mut settings = state.settings.clone();
+    settings.explorer_folders.retain(|path| {
+        match crate::jump_list::pin_explorer_folder(path, state.hwnd) {
+            Ok(()) => false,
+            Err(error) => {
+                eprintln!(
+                    "[explorer-folders] Cannot migrate {}: {error:#}",
+                    path.display()
+                );
+                true
+            }
+        }
+    });
+    if settings.explorer_folders.len() != state.settings.explorer_folders.len() {
+        match settings.save() {
+            Ok(()) => state.settings = settings,
+            Err(error) => app_error(state.hwnd, &error),
+        }
+    }
+}
 unsafe fn task_menu(state: &mut State, id: usize) {
     unsafe {
         if state
@@ -1698,13 +1773,17 @@ unsafe fn task_menu(state: &mut State, id: usize) {
             .find(|window| window.hwnd == foreground)
             .or_else(|| task.windows.iter().find(|window| window.hwnd == task.hwnd))
             .or_else(|| task.windows.first());
-        let query = crate::jump_list::Query::new(
+        let mut query = crate::jump_list::Query::new(
             window.map(|window| window.hwnd as usize).unwrap_or(0),
             window.map(|window| window.pid).unwrap_or(0),
             task.executable.clone(),
             task.pin.as_ref().map(|pin| pin.launch.clone()),
         );
         let title = task.title.clone();
+        if crate::task_apps::is_explorer(&task.executable) {
+            query.app_id = Some(crate::jump_list::EXPLORER_APP_ID.into());
+            migrate_explorer_folders(state);
+        }
         let anchor = popup_anchor(state, &Action::Task(id));
         state.context_task = Some(id);
         state.jump_snapshot = None;
@@ -1746,6 +1825,23 @@ unsafe fn task_command(state: &mut State, target: crate::task_popup::Target) {
             }
             return;
         }
+        if let Target::RemoveExplorerFolder { generation, index } = target {
+            if generation == state.jump_generation
+                && let Some(snapshot) = &state.jump_snapshot
+            {
+                match snapshot.unpin_explorer_folder(index, state.hwnd) {
+                    Ok(()) => {
+                        if let Some(hub) = &state.jump_hub {
+                            let mut query = crate::jump_list::Query::new(0, 0, String::new(), None);
+                            query.app_id = Some(crate::jump_list::EXPLORER_APP_ID.into());
+                            state.jump_generation = hub.request(query);
+                        }
+                    }
+                    Err(error) => app_error(state.hwnd, &error),
+                }
+            }
+            return;
+        }
         if let Target::Script { generation, index } = target {
             if generation == state.jump_generation
                 && let Some(script) = state.script_snapshot.get(index)
@@ -1755,7 +1851,9 @@ unsafe fn task_command(state: &mut State, target: crate::task_popup::Target) {
             }
             return;
         }
-        if let Target::Jump { generation, index } = target {
+        if let Target::Jump { generation, index } | Target::ExplorerFolder { generation, index } =
+            target
+        {
             if generation == state.jump_generation
                 && let Some(snapshot) = &state.jump_snapshot
                 && let Err(error) = snapshot.invoke(index, state.hwnd)
@@ -2237,8 +2335,10 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 0
             }
             WM_DROPFILES => {
+                let mut point = POINT::default();
+                let on_client = DragQueryPoint(w as HDROP, &mut point) != 0;
                 let paths = dropped_files(w as HDROP);
-                add_shortcuts(state, paths);
+                drop_shortcuts(state, on_client.then_some(point), paths);
                 0
             }
             TRAY_DROP => {
@@ -3920,7 +4020,6 @@ unsafe fn smoke_environment(state: &mut State, directory: &std::path::Path) -> R
 }
 unsafe fn smoke_script_drop(state: &mut State, directory: &std::path::Path) -> Result<()> {
     unsafe {
-        use windows_sys::Win32::System::Memory::*;
         anyhow::ensure!(
             crate::data_paths::root()?.canonicalize()?
                 == directory.join("profile").canonicalize()?,
@@ -3951,8 +4050,16 @@ unsafe fn smoke_script_drop(state: &mut State, directory: &std::path::Path) -> R
         }
         paths.push(directory.join("script-alias.lnk"));
         paths.push(paths[2].clone());
+        send_smoke_drop(state.hwnd, POINT { x: 0, y: 0 }, &paths)?;
+        anyhow::ensure!(state.pins.len() == 3, "拖入的程序和脚本未正确归类");
+        verify_script_drop(state, directory, &fixtures)
+    }
+}
+unsafe fn send_smoke_drop(hwnd: HWND, point: POINT, paths: &[std::path::PathBuf]) -> Result<()> {
+    unsafe {
+        use windows_sys::Win32::System::Memory::*;
         let mut text = Vec::new();
-        for path in &paths {
+        for path in paths {
             text.extend(wide(&path.to_string_lossy()));
         }
         text.push(0);
@@ -3965,7 +4072,7 @@ unsafe fn smoke_script_drop(state: &mut State, directory: &std::path::Path) -> R
             memory.cast::<DROPFILES>(),
             DROPFILES {
                 pFiles: size_of::<DROPFILES>() as u32,
-                pt: POINT { x: 0, y: 0 },
+                pt: point,
                 fNC: 0,
                 fWide: 1,
             },
@@ -3976,8 +4083,16 @@ unsafe fn smoke_script_drop(state: &mut State, directory: &std::path::Path) -> R
             text.len() * 2,
         );
         GlobalUnlock(drop);
-        SendMessageW(state.hwnd, WM_DROPFILES, drop as usize, 0);
-        anyhow::ensure!(state.pins.len() == 3, "拖入的程序和脚本未正确归类");
+        SendMessageW(hwnd, WM_DROPFILES, drop as usize, 0);
+        Ok(())
+    }
+}
+unsafe fn verify_script_drop(
+    state: &mut State,
+    directory: &std::path::Path,
+    fixtures: &std::path::Path,
+) -> Result<()> {
+    unsafe {
         anyhow::ensure!(
             state
                 .pins

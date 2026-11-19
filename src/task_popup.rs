@@ -27,6 +27,8 @@ pub enum Target {
     CloseGroup(usize),
     CloseWindow { hwnd: usize, pid: u32 },
     ThisPc,
+    ExplorerFolder { generation: u64, index: usize },
+    RemoveExplorerFolder { generation: u64, index: usize },
     SettingsCommand(usize),
     TaskbarCommand(usize),
     Jump { generation: u64, index: usize },
@@ -51,6 +53,8 @@ impl Target {
             | Self::Script { .. }
             | Self::RenameScript { .. }
             | Self::TaskbarCommand(_)
+            | Self::ExplorerFolder { .. }
+            | Self::RemoveExplorerFolder { .. }
             | Self::ThisPc => true,
             Self::SettingsCommand(_) => true,
             Self::Window { hwnd, pid } | Self::CloseWindow { hwnd, pid } => unsafe {
@@ -71,6 +75,7 @@ pub struct Item {
     glyph: Option<&'static str>,
     pub separator_before: bool,
     pub tooltip: Option<String>,
+    pub scroll_section: bool,
 }
 impl Item {
     pub unsafe fn new(target: Target, title: String, icon: HICON, active: bool) -> Self {
@@ -84,6 +89,7 @@ impl Item {
                 glyph: None,
                 separator_before: false,
                 tooltip: None,
+                scroll_section: false,
             }
         }
     }
@@ -97,6 +103,7 @@ impl Item {
             glyph: Some(glyph),
             separator_before: false,
             tooltip: None,
+            scroll_section: false,
         }
     }
 }
@@ -297,8 +304,10 @@ impl Popup {
             if GetCapture() == self.state.hwnd {
                 ReleaseCapture();
             }
+            if !items.iter().any(|item| item.scroll_section) {
+                self.state.scroll = 0;
+            }
             self.state.items = items;
-            self.state.scroll = 0;
             self.state.focused = self
                 .state
                 .items
@@ -330,6 +339,52 @@ fn visible_scroll(focused: usize, scroll: usize, rows: usize, count: usize) -> u
     }
     scroll.min(count.saturating_sub(rows))
 }
+impl State {
+    fn scroll_bounds(&self) -> (usize, usize, usize) {
+        if let Some(start) = self.items.iter().position(|item| item.scroll_section) {
+            let end = self
+                .items
+                .iter()
+                .rposition(|item| item.scroll_section)
+                .unwrap()
+                + 1;
+            let fixed = start + self.items.len() - end;
+            if fixed < self.rows {
+                return (start, end, self.rows - fixed);
+            }
+        }
+        (0, self.items.len(), self.rows)
+    }
+
+    fn row_index(&self, row: usize) -> Option<usize> {
+        let (start, end, rows) = self.scroll_bounds();
+        let index = if row < start {
+            row
+        } else if row < start + rows {
+            row + self.scroll
+        } else {
+            end + row - start - rows
+        };
+        (row < self.rows && index < self.items.len()).then_some(index)
+    }
+
+    fn reveal_focus(&mut self) {
+        let (start, end, rows) = self.scroll_bounds();
+        self.scroll = if (start..end).contains(&self.focused) {
+            visible_scroll(self.focused - start, self.scroll, rows, end - start)
+        } else {
+            self.scroll.min((end - start).saturating_sub(rows))
+        };
+    }
+}
+
+fn row_action(target: Target) -> Option<bool> {
+    if matches!(target, Target::ExplorerFolder { .. }) {
+        Some(true)
+    } else {
+        target.close_available()
+    }
+}
 fn unit(state: &State, n: i32) -> i32 {
     n * state.dpi / 96
 }
@@ -351,8 +406,7 @@ fn hit(state: &State, x: i32, y: i32) -> Option<Hit> {
         return None;
     }
     let row = ((y - unit(state, 8)) / unit(state, 44).max(1)) as usize;
-    if row < state.rows && state.scroll + row < state.items.len() {
-        let index = state.scroll + row;
+    if let Some(index) = state.row_index(row) {
         let close = close_rect(
             state,
             RECT {
@@ -362,7 +416,7 @@ fn hit(state: &State, x: i32, y: i32) -> Option<Hit> {
                 bottom: unit(state, 48 + row as i32 * 44),
             },
         );
-        if state.items[index].target.close_available().is_some()
+        if row_action(state.items[index].target).is_some()
             && x >= close.left
             && x < close.right
             && y >= close.top
@@ -434,7 +488,7 @@ unsafe fn position(state: &mut State) {
         );
         let (bounds, rows) = layout(state.anchor, monitor.rcWork, state.dpi, state.items.len());
         state.rows = rows;
-        state.scroll = visible_scroll(state.focused, state.scroll, state.rows, state.items.len());
+        state.reveal_focus();
         let width = bounds.right - bounds.left;
         let height = bounds.bottom - bounds.top;
         SetWindowPos(
@@ -498,6 +552,11 @@ unsafe fn close_window(state: &mut State, index: usize) {
         let Some(item) = state.items.get(index) else {
             return;
         };
+        if let Target::ExplorerFolder { generation, index } = item.target {
+            state.selection = Some(Target::RemoveExplorerFolder { generation, index });
+            PostMessageW(state.owner, SELECTED, 0, 0);
+            return;
+        }
         if let Target::Window { hwnd, pid } = item.target {
             if item.target.valid() {
                 // Request a normal close: the application retains control over save prompts.
@@ -627,19 +686,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
             }
             WM_MOUSEWHEEL => {
                 let steps = (w >> 16) as u16 as i16 as i32 / 120;
+                let (start, end, rows) = state.scroll_bounds();
+                if start != 0 {
+                    let mut point = POINT {
+                        x: l as u16 as i16 as i32,
+                        y: (l >> 16) as u16 as i16 as i32,
+                    };
+                    ScreenToClient(hwnd, &mut point);
+                    if !(unit(state, 8 + start as i32 * 44)
+                        ..unit(state, 8 + (start + rows) as i32 * 44))
+                        .contains(&point.y)
+                    {
+                        return 0;
+                    }
+                }
                 state.scroll = if steps > 0 {
                     state.scroll.saturating_sub(steps as usize * 3)
                 } else {
                     (state.scroll + steps.unsigned_abs() as usize * 3)
-                        .min(state.items.len().saturating_sub(state.rows))
+                        .min((end - start).saturating_sub(rows))
                 };
                 state.hover = None;
-                state.focused = state.focused.clamp(
-                    state.scroll,
-                    (state.scroll + state.rows)
-                        .min(state.items.len())
-                        .saturating_sub(1),
-                );
+                if (start..end).contains(&state.focused) {
+                    state.focused = state.focused.clamp(
+                        start + state.scroll,
+                        (start + state.scroll + rows).min(end).saturating_sub(1),
+                    );
+                }
                 InvalidateRect(hwnd, null(), 0);
                 0
             }
@@ -663,7 +736,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                         VK_NEXT => (state.focused + state.rows).min(count - 1),
                         _ => return DefWindowProcW(hwnd, message, w, l),
                     };
-                    state.scroll = visible_scroll(state.focused, state.scroll, state.rows, count);
+                    state.reveal_focus();
                     state.hover = None;
                     InvalidateRect(hwnd, null(), 0);
                 }
@@ -720,21 +793,19 @@ unsafe fn paint(state: &mut State) {
             );
         };
         let mut tips = vec![];
-        for (row, (index, item)) in state
-            .items
-            .iter()
-            .enumerate()
-            .skip(state.scroll)
-            .take(state.rows)
-            .enumerate()
-        {
+        for row in 0..state.rows {
+            let Some(index) = state.row_index(row) else {
+                continue;
+            };
+            let item = &state.items[index];
             let rect = RECT {
                 left: unit(state, 8),
                 top: unit(state, 8 + row as i32 * 44),
                 right: area.right - unit(state, 8),
                 bottom: unit(state, 48 + row as i32 * 44),
             };
-            let close_available = item.target.close_available();
+            let close_available = row_action(item.target);
+            let removing_folder = matches!(item.target, Target::ExplorerFolder { .. });
             if item.separator_before && row > 0 {
                 let brush = CreateSolidBrush(p.border);
                 let line = RECT {
@@ -807,7 +878,11 @@ unsafe fn paint(state: &mut State) {
                 }
                 SelectObject(dc, state.icons);
                 text(
-                    "\u{e711}",
+                    if removing_folder {
+                        "\u{e77a}"
+                    } else {
+                        "\u{e711}"
+                    },
                     close,
                     if close_available == Some(false) {
                         p.disabled
@@ -821,7 +896,12 @@ unsafe fn paint(state: &mut State) {
                 SelectObject(dc, state.font);
                 tips.push(Tip {
                     bounds: (close.left, close.top, close.right, close.bottom),
-                    text: "关闭此窗口".into(),
+                    text: if removing_folder {
+                        "取消固定文件夹"
+                    } else {
+                        "关闭此窗口"
+                    }
+                    .into(),
                 });
             }
             tips.push(Tip {
@@ -839,14 +919,15 @@ unsafe fn paint(state: &mut State) {
             });
         }
         SelectObject(dc, old);
-        if state.items.len() > state.rows {
-            let top = unit(state, 10);
-            let height = (area.bottom - unit(state, 20)).max(1);
-            let thumb_height = (height * state.rows as i32 / state.items.len() as i32)
+        let (start, end, rows) = state.scroll_bounds();
+        let count = end - start;
+        if count > rows {
+            let top = unit(state, 10 + start as i32 * 44);
+            let height = unit(state, rows as i32 * 44 - 4).max(1);
+            let thumb_height = (height * rows as i32 / count as i32)
                 .max(unit(state, 22))
                 .min(height);
-            let offset = (height - thumb_height) * state.scroll as i32
-                / (state.items.len() - state.rows) as i32;
+            let offset = (height - thumb_height) * state.scroll as i32 / (count - rows) as i32;
             rounded(
                 RECT {
                     left: area.right - unit(state, 5),
@@ -995,6 +1076,52 @@ pub fn preview_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn explorer_folder_scroll_keeps_header_and_commands_clickable() {
+        unsafe {
+            let mut popup = fixture(20);
+            let hwnd = popup.state.hwnd;
+            popup.state.items[0].target = Target::ThisPc;
+            for (index, item) in popup.state.items[1..17].iter_mut().enumerate() {
+                item.target = Target::ExplorerFolder {
+                    generation: 1,
+                    index,
+                };
+                item.scroll_section = true;
+            }
+            assert_eq!(popup.state.scroll_bounds(), (1, 17, 4));
+            let mut point = POINT { x: 20, y: 70 };
+            ClientToScreen(hwnd, &mut point);
+            let coordinates = (point.x as u16 as u32 | ((point.y as u16 as u32) << 16)) as isize;
+            SendMessageW(
+                hwnd,
+                WM_MOUSEWHEEL,
+                (-120i16 as u16 as usize) << 16,
+                coordinates,
+            );
+            assert_eq!(hit(&popup.state, 20, 30), Some(Hit::Select(0)));
+            assert_eq!(hit(&popup.state, 20, 70), Some(Hit::Select(4)));
+            assert_eq!(hit(&popup.state, 20, 240), Some(Hit::Select(17)));
+            SendMessageW(hwnd, WM_KEYDOWN, VK_END as usize, 0);
+            for _ in 0..3 {
+                SendMessageW(hwnd, WM_KEYDOWN, VK_UP as usize, 0);
+            }
+            assert_eq!(popup.state.row_index(4), Some(16));
+            assert_eq!(popup.state.row_index(7), Some(19));
+            let mut rect = RECT::default();
+            GetClientRect(hwnd, &mut rect);
+            let click = ((rect.right - 24) | (204 << 16)) as isize;
+            SendMessageW(hwnd, WM_LBUTTONDOWN, 0, click);
+            SendMessageW(hwnd, WM_LBUTTONUP, 0, click);
+            assert_eq!(
+                popup.take_selection(),
+                Some(Target::RemoveExplorerFolder {
+                    generation: 1,
+                    index: 15
+                })
+            );
+        }
+    }
     #[test]
     fn menu_layout_excludes_the_taskbar_and_has_no_footer_at_common_dpi_scales() {
         for dpi in [96, 144, 192] {

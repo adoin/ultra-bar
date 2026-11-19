@@ -76,6 +76,8 @@ pub struct Settings {
     pub startup_enabled: bool,
     pub hide_fullscreen: bool,
     pub auto_check_updates: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub explorer_folders: Vec<PathBuf>,
 }
 impl Default for Settings {
     fn default() -> Self {
@@ -90,6 +92,7 @@ impl Default for Settings {
             startup_enabled: true,
             hide_fullscreen: true,
             auto_check_updates: true,
+            explorer_folders: Vec::new(),
         }
     }
 }
