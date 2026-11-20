@@ -3092,6 +3092,34 @@ unsafe fn paint(state: &mut State) {
                 )
             })
             .unwrap_or_else(|| (state.time.clone(), String::new()));
+        let clock_pages = clock_provider
+            .map(|widget| {
+                state.clock_feed.width_texts(
+                    &widget.id,
+                    &widget.text,
+                    &state.time,
+                    &state.settings.clock_format,
+                )
+            })
+            .unwrap_or_else(|| [clock_text.clone(), clock_text.clone()]);
+        let measure_clock = |page: &str| {
+            let mut measure: SIZE = zeroed();
+            let text = wide(page);
+            GetTextExtentPoint32W(buffer, text.as_ptr(), (text.len() - 1) as _, &mut measure);
+            measure.cx
+        };
+        let widest_clock = clock_pages
+            .iter()
+            .map(|page| measure_clock(page))
+            .max()
+            .unwrap_or(0);
+        let clock_width = tray_width(widest_clock).max(unit(40)).min(area.right / 2);
+        let (clock_item_left, clock_item_right) = crate::settings::item_edges(0, clock_width);
+        let clock_text_width = clock_item_right - clock_item_left - 2 * tray_padding;
+        let clock_text = clock_provider
+            .and_then(|widget| state.clock_feed.weather_detail(&widget.id, &widget.text))
+            .filter(|detail| measure_clock(detail) <= clock_text_width)
+            .unwrap_or(clock_text);
         let mut animations: BOOL = 1;
         SystemParametersInfoW(
             SPI_GETCLIENTAREAANIMATION,
@@ -3116,27 +3144,6 @@ unsafe fn paint(state: &mut State) {
             .clock_motion
             .frame(clock_now)
             .map(|(old, phase)| (old.to_owned(), phase));
-        let clock_pages = clock_provider
-            .map(|widget| {
-                state.clock_feed.width_texts(
-                    &widget.id,
-                    &widget.text,
-                    &state.time,
-                    &state.settings.clock_format,
-                )
-            })
-            .unwrap_or_else(|| [clock_text.clone(), clock_text.clone()]);
-        let widest_clock = clock_pages
-            .iter()
-            .map(|page| {
-                let mut measure: SIZE = zeroed();
-                let text = wide(page);
-                GetTextExtentPoint32W(buffer, text.as_ptr(), (text.len() - 1) as _, &mut measure);
-                measure.cx
-            })
-            .max()
-            .unwrap_or(0);
-        let clock_width = tray_width(widest_clock).max(unit(40)).min(area.right / 2);
         if state.gpu_meter.is_none()
             && !state.gpu_meter_failed
             && state

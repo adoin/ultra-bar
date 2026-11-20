@@ -170,8 +170,11 @@ struct Summary {
     version: u32,
     display: usize,
     rotation_seconds: u32,
+    clock_seconds: u32,
+    weather_seconds: u32,
     lunar: String,
     weather: String,
+    humidity_percent: Option<u8>,
     tooltip: String,
     clock_format: String,
     utc_offset_seconds: i32,
@@ -259,7 +262,7 @@ impl Feed {
         let rotate = self.summaries.values().any(|s| {
             s.display == 2
                 && !s.weather.is_empty()
-                && phase / interval(s) != self.phase / interval(s)
+                && rotation_page(s, phase) != rotation_page(s, self.phase)
         });
         self.phase = phase;
         changed || rotate
@@ -267,13 +270,21 @@ impl Feed {
     pub fn render(&self, id: &str, template: &str, time: &str, pattern: &str) -> (String, String) {
         self.render_phase(id, template, time, pattern, self.page(id) as u64)
     }
+    pub fn weather_detail(&self, id: &str, template: &str) -> Option<String> {
+        let summary = self.summaries.get(id)?;
+        if self.page(id) != 1 {
+            return None;
+        }
+        let humidity = summary.humidity_percent.filter(|percent| *percent <= 100)?;
+        Some(template.replace("{time}", &format!("{} 湿度{humidity}%", summary.weather)))
+    }
     pub fn page(&self, id: &str) -> usize {
         self.summaries
             .get(id)
             .filter(|s| {
                 s.display == 2 && !s.weather.is_empty() && (now() as i64 - s.updated).abs() <= 180
             })
-            .map_or(0, |s| (self.phase / interval(s) % 2) as usize)
+            .map_or(0, |s| rotation_page(s, self.phase))
     }
     /// Reserve the widest page before rotating, including the template and lunar date.
     pub fn width_texts(&self, id: &str, template: &str, time: &str, pattern: &str) -> [String; 2] {
@@ -333,12 +344,18 @@ impl Feed {
         (template.replace("{time}", &text), tip)
     }
 }
-fn interval(summary: &Summary) -> u64 {
-    if (2..=3600).contains(&summary.rotation_seconds) {
-        summary.rotation_seconds as u64
-    } else {
-        6
+fn rotation_page(summary: &Summary, seconds: u64) -> usize {
+    fn duration(value: u32, fallback: u64) -> u64 {
+        if (2..=3600).contains(&value) {
+            u64::from(value)
+        } else {
+            fallback
+        }
     }
+    let legacy = duration(summary.rotation_seconds, 6);
+    let clock = duration(summary.clock_seconds, legacy);
+    let weather = duration(summary.weather_seconds, legacy);
+    usize::from(seconds % (clock + weather) >= clock)
 }
 impl Drop for Feed {
     fn drop(&mut self) {
@@ -406,15 +423,26 @@ mod tests {
         assert!(!motion.update("another", 1, "weather", false, now + SLIDE_DURATION));
     }
     #[test]
-    fn intervals_support_legacy_summaries_and_reject_invalid_values() {
+    fn rotation_supports_separate_durations_and_legacy_feeds() {
         for (value, expected) in [(0, 6), (1, 6), (2, 2), (12, 12), (3600, 3600), (3601, 6)] {
             assert_eq!(
-                interval(&Summary {
-                    rotation_seconds: value,
-                    ..Default::default()
-                }),
-                expected
+                rotation_page(
+                    &Summary {
+                        rotation_seconds: value,
+                        ..Default::default()
+                    },
+                    expected
+                ),
+                1
             );
+        }
+        let summary = Summary {
+            clock_seconds: 12,
+            weather_seconds: 4,
+            ..Default::default()
+        };
+        for (seconds, page) in [(0, 0), (11, 0), (12, 1), (15, 1), (16, 0), (28, 1)] {
+            assert_eq!(rotation_page(&summary, seconds), page);
         }
     }
     #[test]
@@ -435,6 +463,7 @@ mod tests {
                 display: 1,
                 lunar: "正月初一".into(),
                 weather: "晴 16°C".into(),
+                humidity_percent: Some(75),
                 updated: now() as i64,
                 ..Default::default()
             },
@@ -450,6 +479,10 @@ mod tests {
         assert_eq!(pages[1], "[晴 16°C]");
         feed.phase = 6;
         assert_eq!(
+            feed.weather_detail("calendar", "[{time}]").as_deref(),
+            Some("[晴 16°C 湿度75%]")
+        );
+        assert_eq!(
             pages,
             feed.width_texts("calendar", "[{time}]", "fallback", "HH:mm")
         );
@@ -458,6 +491,7 @@ mod tests {
             "晴 16°C"
         );
         feed.phase = 0;
+        assert!(feed.weather_detail("calendar", "{time}").is_none());
         assert!(
             feed.render("calendar", "{time}", "fallback", "HH:mm")
                 .0
