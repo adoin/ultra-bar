@@ -1,6 +1,7 @@
 //! DWM advances a repeating visual transform. No application frame timer or render loop.
 use super::*;
 use anyhow::{Context, Result};
+use std::time::{Duration, Instant};
 use ultra_bar_plugin_sdk::Page;
 use windows::{
     Win32::{
@@ -14,6 +15,45 @@ use windows::{
     },
     core::Interface,
 };
+pub(crate) struct DeviceRetry {
+    pub has_rendered: bool,
+    next: Option<Instant>,
+    failures: u32,
+}
+
+impl DeviceRetry {
+    pub(crate) fn new(has_rendered: bool, now: Instant) -> Self {
+        Self {
+            has_rendered,
+            next: Some(now),
+            failures: 0,
+        }
+    }
+
+    pub(crate) fn due(&self, now: Instant) -> bool {
+        self.next.is_some_and(|next| now >= next)
+    }
+
+    pub(crate) fn failed(&self) -> bool {
+        self.failures != 0
+    }
+
+    pub(crate) fn fail(&mut self, now: Instant) -> Option<Duration> {
+        let delay = self
+            .has_rendered
+            .then(|| Duration::from_secs((2 << self.failures.min(5)).min(60)));
+        self.next = delay.map(|delay| now + delay);
+        self.failures = self.failures.saturating_add(1);
+        delay
+    }
+
+    pub(crate) fn rendered(&mut self) {
+        self.has_rendered = true;
+        self.next = None;
+        self.failures = 0;
+    }
+}
+
 #[derive(Clone, PartialEq)]
 pub struct Meter {
     pub id: String,
@@ -178,7 +218,7 @@ pub struct Compositor {
     owner: windows_sys::Win32::Foundation::HWND,
     pub(crate) device: IDCompositionDevice,
     context: ID3D11DeviceContext,
-    _gpu: ID3D11Device,
+    gpu: ID3D11Device,
     _target: IDCompositionTarget,
     pub(crate) root: IDCompositionVisual,
     nodes: Vec<Node>,
@@ -193,6 +233,9 @@ fn premultiply(pixel: u32) -> u32 {
         | ((pixel & 255) * a / 255)
 }
 impl Compositor {
+    pub(crate) fn device_removed_reason(&self) -> windows::core::Result<()> {
+        unsafe { self.gpu.GetDeviceRemovedReason() }
+    }
     pub unsafe fn input_visibility(&self, visible: bool) {
         unsafe {
             for node in &self.nodes {
@@ -246,7 +289,7 @@ impl Compositor {
                 owner: hwnd,
                 device,
                 context: context.context("No D3D context")?,
-                _gpu: gpu,
+                gpu,
                 _target: target,
                 root,
                 nodes: vec![],
@@ -398,7 +441,7 @@ impl Compositor {
             let inset = self.image(w, h, &super::inset_pixels(w, h, spec.accent))?;
             visual.AddVisual(&inset, false, None)?;
             let caption = caption_pixels(spec, w, h)?;
-            for (radius, dy, opacity) in [(2, 1, 0.55), (1, 0, 0.95)] {
+            for (radius, dy, opacity) in super::CAPTION_SHADOWS {
                 let shadow = super::text_shadow(&caption, w, h, radius, dy, opacity);
                 let shade = self.image(w, h, &shadow)?;
                 visual.AddVisual(&shade, false, None)?;
@@ -778,6 +821,36 @@ pub unsafe fn smoke(directory: &std::path::Path) -> Result<()> {
             directory.join("gpu-low-fill.json"),
             serde_json::to_vec_pretty(&cases)?,
         )?;
+        drop(composition);
+        let mut replacement = Compositor::new(hwnd)?;
+        replacement.sync(vec![spec])?;
+        replacement.device.WaitForCommitCompletion()?;
+        replacement.device_removed_reason()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn known_gpu_retries_after_startup_or_render_failure_with_bounded_backoff() {
+        let now = Instant::now();
+        let mut unverified = DeviceRetry::new(false, now);
+        assert!(unverified.due(now));
+        assert_eq!(unverified.fail(now), None);
+        assert!(!unverified.due(now + Duration::from_secs(60)));
+
+        let mut verified = DeviceRetry::new(true, now);
+        for seconds in [2, 4, 8, 16, 32, 60, 60] {
+            let delay = Duration::from_secs(seconds);
+            assert_eq!(verified.fail(now), Some(delay));
+            assert!(!verified.due(now + delay - Duration::from_millis(1)));
+            assert!(verified.due(now + delay));
+        }
+        verified.rendered();
+        assert!(!verified.failed());
+        assert_eq!(verified.fail(now), Some(Duration::from_secs(2)));
     }
 }

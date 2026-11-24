@@ -489,6 +489,7 @@ impl Surface {
             let hover = theme::colorref(theme::palette().hover);
             let mut effects = self.effects.borrow_mut();
             let mut foreground = self.foreground.borrow_mut();
+            let cutouts = self.cutouts.borrow();
             if effects.is_empty() {
                 effects.resize((self.width * self.height) as usize, 0);
             }
@@ -504,9 +505,11 @@ impl Surface {
                     }
                     let i = (y * self.width + x) as usize;
                     let old = *self.pixels.add(i);
-                    let da = (premultiply_effect(old, effects[i], glass, background, hover) >> 24)
-                        as f64
-                        / 255.;
+                    let mut backing = premultiply_effect(old, effects[i], glass, background, hover);
+                    if old == background && effects[i] == 0 {
+                        backing = apply_cutout(backing, cutouts.get(i).copied().unwrap_or(0));
+                    }
+                    let da = (backing >> 24) as f64 / 255.;
                     let alpha = sa + da * (1. - sa);
                     let channel = |shift: u32| {
                         ((((source >> shift) & 255) as f64 * sa
@@ -1182,6 +1185,22 @@ mod tests {
             assert_eq!(surface.copy_pixels()[0], 0xff8080);
             surface.effect(0, 0, 2, 2, &[0xff003300; 4]);
             assert_eq!(surface.copy_pixels()[0], 0xff8080);
+        }
+    }
+    #[test]
+    fn overlay_preserves_fractional_alpha_on_a_cleared_capsule() {
+        unsafe {
+            let surface = Surface::new(16, 8).unwrap();
+            let rect = RECT {
+                left: 0,
+                top: 0,
+                right: 16,
+                bottom: 8,
+            };
+            FillRect(surface.dc, &rect, theme::background_brush());
+            surface.clear_rounded(&rect, 4.);
+            surface.overlay_effect(8, 4, 1, 1, &[0x80ffffff], true);
+            assert_eq!(surface.effects.borrow()[4 * 16 + 8], 0x80ffffff);
         }
     }
     #[test]

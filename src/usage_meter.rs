@@ -346,8 +346,8 @@ pub(super) fn text_shadow(
                     let (sx, sy) = (x + ox, y + oy - dy);
                     if sx >= 0 && sx < w && sy >= 0 && sy < h {
                         let alpha = (pixels[(sy * w + sx) as usize] >> 24) as f64;
-                        let falloff = 1.
-                            - (ox * ox + oy * oy) as f64 / ((radius + 1) * (radius + 1) * 2) as f64;
+                        let falloff =
+                            1. - (ox * ox + oy * oy) as f64 / (radius * radius + 1) as f64;
                         a = a.max(alpha * falloff);
                     }
                 }
@@ -379,43 +379,53 @@ pub(super) unsafe fn caption(dc: HDC, rect: &RECT, text: &str, trailing: &str, f
         DrawTextW(dc, crate::visual::wide(text).as_ptr(), -1, &mut main, flags);
     }
 }
-pub unsafe fn label(dc: HDC, rect: &RECT, text: &str, trailing: &str) {
-    unsafe {
-        let base = Hsl::from_rgb(theme::accent_rgb());
-        let color = SetTextColor(
-            dc,
-            theme::colorref(
-                Hsl {
-                    h: base.h,
-                    s: base.s * 0.3,
-                    l: 0.06,
-                }
-                .rgb(),
-            ),
-        );
-        let flags = DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS;
-        let mut shadow = *rect;
-        OffsetRect(&mut shadow, 0, 2);
-        caption(dc, &shadow, text, trailing, flags);
-        for (y, x) in [
-            (-1, -1),
-            (-1, 0),
-            (-1, 1),
-            (0, -1),
-            (0, 1),
-            (1, -1),
-            (1, 0),
-            (1, 1),
-        ] {
-            let mut edge = *rect;
-            OffsetRect(&mut edge, x, y);
-            caption(dc, &edge, text, trailing, flags);
-        }
-        SetTextColor(dc, theme::palette().text);
-        let foreground = *rect;
-        caption(dc, &foreground, text, trailing, flags);
-        SetTextColor(dc, color);
+const CAPTION_SHADOWS: [(i32, i32, f64); 2] = [(2, 1, 0.45), (1, 0, 0.75)];
+
+struct CaptionLayers {
+    spec: compositor::Meter,
+    pixels: [Vec<u32>; 3],
+}
+thread_local! {
+    static FALLBACK_CAPTION: RefCell<Option<CaptionLayers>> = const { RefCell::new(None) };
+}
+
+/// Composite the same antialiased glyph mask and shadows used by DirectComposition.
+pub unsafe fn draw_label(surface: &Surface, spec: compositor::Meter, glass: bool) {
+    let (left, top, right, bottom) = spec.bounds;
+    let (w, h) = (right - left, bottom - top);
+    if w < 2 || h < 2 {
+        return;
     }
+    FALLBACK_CAPTION.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.as_ref().is_none_or(|cached| cached.spec != spec) {
+            let Ok(label) = (unsafe { compositor::caption_pixels(&spec, w, h) }) else {
+                return;
+            };
+            let [ambient, edge] = CAPTION_SHADOWS
+                .map(|(radius, dy, opacity)| text_shadow(&label, w, h, radius, dy, opacity));
+            let mut pixels = [ambient, edge, label];
+            for layer in &mut pixels {
+                for y in 0..h {
+                    for x in 0..w {
+                        let pixel = &mut layer[(y * w + x) as usize];
+                        if *pixel >> 24 != 0 {
+                            let alpha = ((*pixel >> 24) as f64
+                                * coverage(x as f64, y as f64, w as f64, h as f64))
+                            .round() as u32;
+                            *pixel = alpha << 24 | (*pixel & 0xffffff);
+                        }
+                    }
+                }
+            }
+            *cache = Some(CaptionLayers { spec, pixels });
+        }
+        if let Some(cached) = cache.as_ref() {
+            for layer in &cached.pixels {
+                unsafe { surface.overlay_effect(left, top, w, h, layer, glass) };
+            }
+        }
+    });
 }
 pub unsafe fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
     unsafe {
@@ -462,7 +472,7 @@ pub unsafe fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
                     ("Codex 36%", Some(0.36)),
                     ("Codex 1%", Some(0.01)),
                     ("Codex 100%", Some(1.)),
-                    ("Codex 5%", Some(0.05)),
+                    ("Grok —", None),
                 ]
                 .into_iter()
                 .enumerate()
@@ -474,15 +484,28 @@ pub unsafe fn smoke(directory: &std::path::Path) -> anyhow::Result<()> {
                         bottom: 20 + row as i32 * 70 + height,
                     };
                     draw(&surface, &rect, progress);
-                    let text_rect = RECT {
-                        left: rect.left + 8,
-                        ..rect
+                    let page = ultra_bar_plugin_sdk::Page {
+                        text: text.into(),
+                        ..Default::default()
                     };
-                    label(surface.dc, &text_rect, text, "");
+                    draw_label(
+                        &surface,
+                        compositor::spec("preview", &rect, &page, None, 1., font, 4),
+                        true,
+                    );
                 }
             }
             SelectObject(surface.dc, old);
             ultra_bar_native_ui::fonts::delete_object(font);
+            for (index, pixel) in surface.straight_pixels(true).into_iter().enumerate() {
+                let (x, y) = (index as i32 % 640, index as i32 / 640);
+                let backdrop = if y < 80 { 0x181818 } else { 0xf0f0f0 };
+                surface.pixel(
+                    x,
+                    y,
+                    theme::blend(pixel & 0xffffff, backdrop, (pixel >> 24) as f64 / 255.),
+                );
+            }
             surface.save_bmp(&directory.join(format!("usage-bubbles-{name}.bmp")))?;
         }
         theme::set_accent(original);
@@ -551,10 +574,9 @@ mod tests {
                     assert_eq!(caption[i] >> 24, alpha);
                 }
             }
-            let atlas = Surface::new(256, 40).unwrap();
-            for (column, background) in [0x0c1018, 0xf0f0f0].into_iter().enumerate() {
+            for background in [0x0c1018, 0xf0f0f0] {
                 let mut pixels = vec![background; caption.len()];
-                for (radius, dy, opacity) in [(2, 1, 0.55), (1, 0, 0.95)] {
+                for (radius, dy, opacity) in CAPTION_SHADOWS {
                     let shade = text_shadow(&caption, 112, 22, radius, dy, opacity);
                     for (p, s) in pixels.iter_mut().zip(shade) {
                         *p = theme::blend(s & 0xffffff, *p, (s >> 24) as f64 / 255.);
@@ -564,25 +586,11 @@ mod tests {
                     *p = theme::blend(s & 0xffffff, *p, (s >> 24) as f64 / 255.);
                 }
                 assert!(pixels.iter().any(|p| *p > 0xf0f0f0));
-                if column == 1 {
-                    assert!(pixels.iter().any(|p| *p < 0x303030));
-                }
-                for y in 0..22 {
-                    for x in 0..112 {
-                        atlas.pixel(
-                            column as i32 * 128 + 8 + x,
-                            8 + y,
-                            pixels[(y * 112 + x) as usize],
-                        );
-                    }
+                if background == 0xf0f0f0 {
+                    assert!(pixels.iter().any(|p| *p < 0x707070));
                 }
             }
             ultra_bar_native_ui::fonts::delete_object(font);
-            atlas
-                .save_bmp(std::path::Path::new(
-                    "D:/tmp/ultra-bar-agent-dashboard-20261111/caption-contrast.bmp",
-                ))
-                .unwrap();
         }
     }
     #[test]

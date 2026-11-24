@@ -166,7 +166,7 @@ struct State {
     widgets: Vec<Widget>,
     services: crate::plugin_services::Manager,
     gpu_meter: Option<crate::usage_meter::compositor::Compositor>,
-    gpu_meter_failed: bool,
+    gpu_meter_retry: crate::usage_meter::compositor::DeviceRetry,
     panel_started: Vec<std::path::PathBuf>,
     tasks: Vec<Task>,
     hits: Vec<Hit>,
@@ -324,7 +324,10 @@ pub fn run(options: Options) -> Result<()> {
             clock_feed: crate::clock_feed::Feed::new(0, CLOCK_UPDATE),
             clock_motion: crate::clock_feed::Motion::default(),
             gpu_meter: None,
-            gpu_meter_failed: false,
+            gpu_meter_retry: crate::usage_meter::compositor::DeviceRetry::new(
+                !options.isolated && gpu_meter_marker().is_ok_and(|path| path.is_file()),
+                Instant::now(),
+            ),
             panel_started: vec![],
             tasks: vec![],
             hits: vec![],
@@ -2143,7 +2146,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                 .collect();
             eprintln!(
                 "[service-diagnostics] {}",
-                serde_json::json!({"services":state.services.diagnostics(),"hits":hits,"gpu_meter":state.gpu_meter.is_some(),"gpu_failed":state.gpu_meter_failed,"tray_count":state.tray_snapshot.items.len(),"icons_only":state.settings.icons_only,"first_pin":state.pins.first().map(|p|p.name.as_str())})
+                serde_json::json!({"services":state.services.diagnostics(),"hits":hits,"gpu_meter":state.gpu_meter.is_some(),"gpu_failed":state.gpu_meter_retry.failed(),"gpu_known":state.gpu_meter_retry.has_rendered,"tray_count":state.tray_snapshot.items.len(),"icons_only":state.settings.icons_only,"first_pin":state.pins.first().map(|p|p.name.as_str())})
             );
             return 1;
         }
@@ -2497,6 +2500,12 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
                     });
                 let mut changed = time != state.time;
                 changed |= state.clock_feed.poll(&state.widgets);
+                changed |= w == 1
+                    && state.gpu_meter.is_none()
+                    && state.gpu_meter_retry.failed()
+                    && state.gpu_meter_retry.due(Instant::now())
+                    && IsWindowVisible(hwnd) != 0
+                    && usage_meter_needed(state);
                 state.time = time;
                 let foreground = effective_foreground();
                 let foreground_changed = foreground != state.foreground;
@@ -3040,6 +3049,40 @@ unsafe extern "system" fn wndproc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM
     }
 }
 
+fn gpu_meter_marker() -> Result<std::path::PathBuf> {
+    Ok(crate::data_paths::root()?.join("gpu-composition.ok"))
+}
+
+fn usage_meter_needed(state: &State) -> bool {
+    state
+        .widgets
+        .iter()
+        .any(|widget| widget.slot == Slot::Tray && state.services.page(&widget.id).is_some())
+}
+
+fn log_gpu_meter_failure(
+    retry_state: &mut crate::usage_meter::compositor::DeviceRetry,
+    operation: &str,
+    error: &anyhow::Error,
+    reason: Option<windows::core::Result<()>>,
+) {
+    let retry = retry_state.fail(Instant::now());
+    let hresult = |error: &windows::core::Error| format!("0x{:08X}", error.code().0 as u32);
+    ultra_bar_native_ui::diagnostics::event(
+        "render",
+        "usage_meter.gpu_failure",
+        serde_json::json!({
+            "operation":operation,
+            "error":format!("{error:#}"),
+            "hresult":error.downcast_ref::<windows::core::Error>().map(hresult),
+            "device_removed_reason":reason.as_ref().map(|reason| reason.as_ref().map_or_else(hresult, |_| "0x00000000".into())),
+            "reason_message":reason.and_then(Result::err).map(|error| error.to_string()),
+            "gpu_known":retry_state.has_rendered,
+            "retry_seconds":retry.map(|delay| delay.as_secs()),
+        }),
+    );
+}
+
 unsafe fn paint(state: &mut State) {
     unsafe {
         let mut ps: PAINTSTRUCT = zeroed();
@@ -3145,20 +3188,13 @@ unsafe fn paint(state: &mut State) {
             .frame(clock_now)
             .map(|(old, phase)| (old.to_owned(), phase));
         if state.gpu_meter.is_none()
-            && !state.gpu_meter_failed
-            && state
-                .widgets
-                .iter()
-                .any(|w| w.slot == Slot::Tray && state.services.page(&w.id).is_some())
+            && state.gpu_meter_retry.due(Instant::now())
+            && usage_meter_needed(state)
         {
             match crate::usage_meter::compositor::Compositor::new(state.hwnd) {
-                Ok(compositor) => {
-                    eprintln!("[usage-meter] DirectComposition hardware timeline enabled");
-                    state.gpu_meter = Some(compositor);
-                }
-                Err(e) => {
-                    eprintln!("[usage-meter] compositor unavailable: {e}");
-                    state.gpu_meter_failed = true;
+                Ok(compositor) => state.gpu_meter = Some(compositor),
+                Err(error) => {
+                    log_gpu_meter_failure(&mut state.gpu_meter_retry, "create", &error, None)
                 }
             }
         }
@@ -3365,32 +3401,13 @@ unsafe fn paint(state: &mut State) {
                         }
                     } else {
                         crate::usage_meter::draw(&surface, &rect, page.progress);
-                        let saved = SaveDC(buffer);
-                        let clip = CreateRoundRectRgn(
-                            rect.left,
-                            rect.top,
-                            rect.right,
-                            rect.bottom,
-                            unit(8),
-                            unit(8),
+                        crate::usage_meter::draw_label(
+                            &surface,
+                            crate::usage_meter::compositor::spec(
+                                "", &rect, page, previous, phase, state.font, padding,
+                            ),
+                            state.glass,
                         );
-                        SelectClipRgn(buffer, clip);
-                        ultra_bar_native_ui::fonts::delete_object(clip);
-                        IntersectClipRect(buffer, rect.left, rect.top, rect.right, rect.bottom);
-                        let displacement = ((rect.bottom - rect.top) as f64 * (1.0 - phase)) as i32;
-                        let mut current = RECT {
-                            top: rect.top + displacement,
-                            bottom: rect.bottom + displacement,
-                            left: rect.left + padding,
-                            right: rect.right - padding,
-                        };
-                        crate::usage_meter::label(buffer, &current, &page.text, &page.trailing);
-                        if let Some(old) = previous {
-                            current.top -= rect.bottom - rect.top;
-                            current.bottom -= rect.bottom - rect.top;
-                            crate::usage_meter::label(buffer, &current, &old.text, &old.trailing);
-                        }
-                        RestoreDC(buffer, saved);
                     }
                 }
             }
@@ -3657,13 +3674,44 @@ unsafe fn paint(state: &mut State) {
             eprintln!("[taskbar-smoke] {error}");
         }
         surface.present(state.hwnd, state.glass);
-        if let Some(compositor) = state.gpu_meter.as_mut()
-            && let Err(e) = compositor.sync(gpu_meters)
-        {
-            eprintln!("[usage-meter] composition failed: {e}");
-            state.gpu_meter = None;
-            state.gpu_meter_failed = true;
-            InvalidateRect(state.hwnd, null(), 0);
+        if let Some(compositor) = state.gpu_meter.as_mut() {
+            let drew_meter = !gpu_meters.is_empty();
+            match compositor.sync(gpu_meters) {
+                Err(error) => {
+                    let reason = compositor.device_removed_reason();
+                    state.gpu_meter = None;
+                    log_gpu_meter_failure(&mut state.gpu_meter_retry, "sync", &error, Some(reason));
+                    InvalidateRect(state.hwnd, null(), 0);
+                }
+                Ok(()) if drew_meter => {
+                    let first_render = !state.gpu_meter_retry.has_rendered;
+                    let recovered = state.gpu_meter_retry.failed();
+                    state.gpu_meter_retry.rendered();
+                    if first_render || recovered {
+                        eprintln!("[usage-meter] DirectComposition hardware timeline enabled");
+                    }
+                    if recovered {
+                        ultra_bar_native_ui::diagnostics::event(
+                            "render",
+                            "usage_meter.gpu_recovered",
+                            serde_json::json!({}),
+                        );
+                    }
+                    if first_render
+                        && !state.isolated
+                        && let Err(error) = gpu_meter_marker().and_then(|path| {
+                            std::fs::create_dir_all(
+                                path.parent().context("Invalid GPU marker path")?,
+                            )?;
+                            std::fs::write(path, [])?;
+                            Ok(())
+                        })
+                    {
+                        eprintln!("[usage-meter] Cannot save GPU capability: {error:#}");
+                    }
+                }
+                Ok(()) => {}
+            }
         }
         if let Some(tooltips) = &mut state.tooltips {
             tooltips.sync(
